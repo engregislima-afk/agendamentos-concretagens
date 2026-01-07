@@ -1,16 +1,18 @@
-# app.py — Habisolute | Agendamentos de Concretagens (Escritório + Celular)
-# Stack: Streamlit + SQLite + Auditoria (quem criou/alterou) + Histórico (antes/depois)
+# app.py — Habisolute | Agendamentos de Concretagens (Cloud-ready + Win11 UI)
+# - Streamlit + PostgreSQL (Supabase) via Secrets (DB_URL) ou SQLite local
+# - Login + Usuários (Admin)
+# - Auditoria: criado_por / alterado_por + histórico (antes/depois)
+# - CNPJ: busca automática (Razão Social / Fantasia / Endereço) via cnpj.ws
+# - Status com cores (Agendado azul, Cancelado vermelho, Aguardando amarelo)
 #
-# Como rodar:
-#   pip install streamlit pandas openpyxl
-#   streamlit run app.py
-#
-# Primeiro acesso (criado automaticamente se não existir usuário):
-#   usuário: admin
-#   senha:   admin123
-# Depois, altere a senha e crie usuários em "Admin > Usuários".
+# Reqs (requirements.txt):
+#   streamlit
+#   pandas
+#   openpyxl
+#   requests
+#   sqlalchemy
+#   psycopg2-binary
 
-import sqlite3
 import json
 import base64
 import hashlib
@@ -19,100 +21,140 @@ from datetime import datetime, date, time, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 
 import pandas as pd
-
-# HTTP (consulta CNPJ)
-try:
-    import requests
-except Exception:
-    requests = None
-
+import requests
 import streamlit as st
 
-DB_PATH = "concretagens.db"
+from sqlalchemy import (
+    create_engine, MetaData, Table, Column,
+    Integer, String, Float, Text, ForeignKey, Boolean,
+    select, insert, update, text
+)
+from sqlalchemy.engine import Engine
+
 TZ_LABEL = "America/Sao_Paulo"
 
-STATUS = ["Agendado", "Confirmado", "Execucao", "Concluido", "Cancelado"]
+# ============================
+# Windows 11-ish styling
+# ============================
+WIN11_CSS = """
+<style>
+:root {
+  --bg: #f3f3f3;
+  --card: #ffffff;
+  --text: #1f1f1f;
+  --muted: #5a5a5a;
+  --border: #e7e7e7;
+  --shadow: 0 6px 22px rgba(0,0,0,.08);
+  --radius: 14px;
+  --blue: #2563eb;
+  --red: #dc2626;
+  --yellow: #f59e0b;
+  --green: #16a34a;
+  --gray: #6b7280;
+}
 
-# ----------------------------
-# Util: tempo / json
-# ----------------------------
+.stApp {
+  background: var(--bg);
+}
+
+section[data-testid="stSidebar"] {
+  background: #ffffff;
+  border-right: 1px solid var(--border);
+}
+
+h1,h2,h3,h4,h5,h6 { color: var(--text); }
+p, li, .stMarkdown { color: var(--text); }
+
+.block-container {
+  padding-top: 1.2rem;
+  padding-bottom: 2rem;
+}
+
+.hab-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+}
+
+.hab-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-weight: 700;
+  font-size: 12px;
+  border: 1px solid rgba(0,0,0,.06);
+}
+
+.hab-chip.blue { background: rgba(37,99,235,.12); color: var(--blue); }
+.hab-chip.red { background: rgba(220,38,38,.12); color: var(--red); }
+.hab-chip.yellow { background: rgba(245,158,11,.18); color: #8a5a00; }
+.hab-chip.green { background: rgba(22,163,74,.14); color: var(--green); }
+.hab-chip.gray { background: rgba(107,114,128,.14); color: var(--gray); }
+
+.small-muted { color: var(--muted); font-size: 12px; }
+
+[data-testid="stMetricValue"] { font-size: 30px; }
+[data-testid="stMetricLabel"] { color: var(--muted); }
+
+button[kind="primary"] {
+  border-radius: 12px !important;
+}
+
+div[data-testid="stDataFrame"] {
+  border-radius: var(--radius);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+}
+</style>
+"""
+
+# ============================
+# Status + cores
+# ============================
+STATUS = ["Agendado", "Aguardando", "Confirmado", "Execucao", "Concluido", "Cancelado"]
+
+def status_chip(status: str) -> str:
+    s = (status or "").strip()
+    cls = "gray"
+    if s == "Agendado":
+        cls = "blue"
+    elif s == "Cancelado":
+        cls = "red"
+    elif s == "Aguardando":
+        cls = "yellow"
+    elif s in ("Confirmado", "Execucao"):
+        cls = "green"
+    elif s == "Concluido":
+        cls = "gray"
+    return f'<span class="hab-chip {cls}">{s}</span>'
+
+def style_status_df(df: pd.DataFrame) -> "pd.io.formats.style.Styler":
+    color_map = {
+        "Agendado": ("#2563eb", "#e8efff"),
+        "Cancelado": ("#dc2626", "#ffecec"),
+        "Aguardando": ("#8a5a00", "#fff3d6"),
+        "Confirmado": ("#166534", "#eaffea"),
+        "Execucao": ("#166534", "#eaffea"),
+        "Concluido": ("#374151", "#f1f5f9"),
+    }
+    def _apply(col: pd.Series):
+        styles = []
+        for v in col.astype(str).tolist():
+            fg, bg = color_map.get(v, ("#374151", "#f1f5f9"))
+            styles.append(f"background-color: {bg}; color: {fg}; font-weight: 700;")
+        return styles
+    return df.style.apply(_apply, subset=["status"])
+
+# ============================
+# Time helpers
+# ============================
 def now_iso() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def only_digits(s: str) -> str:
-    return "".join(ch for ch in (s or "") if ch.isdigit())
-
-def format_city_uf(city: str, uf: str) -> str:
-    city = (city or "").strip()
-    uf = (uf or "").strip()
-    if city and uf:
-        return f"{city} - {uf}"
-    return city or uf or ""
-
-@st.cache_data(ttl=60*60, show_spinner=False)
-def cnpjws_lookup(cnpj_digits: str):
-    """Consulta CNPJ na API pública do CNPJ.ws.
-    Retorna dict (JSON) ou None se não encontrado.
-    Pode lançar RuntimeError('rate_limit') em excesso de requisições.
-    """
-    if requests is None:
-        raise RuntimeError("requests_not_installed")
-
-    url = f"https://publica.cnpj.ws/cnpj/{cnpj_digits}"
-    try:
-        r = requests.get(
-            url,
-            timeout=15,
-            headers={"Accept": "application/json", "User-Agent": "Habisolute-Agendamentos/1.0"},
-        )
-    except Exception as e:
-        raise RuntimeError(f"network_error:{e}") from e
-
-    if r.status_code == 200:
-        try:
-            return r.json()
-        except Exception:
-            raise RuntimeError("invalid_json")
-    if r.status_code == 404:
-        return None
-    if r.status_code == 429:
-        raise RuntimeError("rate_limit")
-    raise RuntimeError(f"http_{r.status_code}")
-
-def parse_cnpjws_to_fields(payload: dict) -> dict:
-    """Extrai razão social, fantasia e endereço do JSON do CNPJ.ws."""
-    razao = (payload.get("razao_social") or "").strip()
-    est = payload.get("estabelecimento") or {}
-    fantasia = (est.get("nome_fantasia") or "").strip()
-
-    tipo_log = (est.get("tipo_logradouro") or "").strip()
-    logradouro = (est.get("logradouro") or "").strip()
-    numero = (est.get("numero") or "").strip()
-    complemento = (est.get("complemento") or "").strip()
-    bairro = (est.get("bairro") or "").strip()
-    cep = (est.get("cep") or "").strip()
-
-    cidade = ((est.get("cidade") or {}).get("nome") or "").strip() if isinstance(est.get("cidade"), dict) else ""
-    uf = ((est.get("estado") or {}).get("sigla") or "").strip() if isinstance(est.get("estado"), dict) else ""
-
-    rua = " ".join([p for p in [tipo_log, logradouro] if p]).strip()
-    end = rua
-    if numero:
-        end = f"{end}, {numero}" if end else numero
-    if complemento:
-        end = f"{end} - {complemento}" if end else complemento
-    if bairro:
-        end = f"{end} - {bairro}" if end else bairro
-    if cep:
-        end = f"{end} - CEP {cep}" if end else f"CEP {cep}"
-
-    return {
-        "razao_social": razao,
-        "nome_fantasia": fantasia,
-        "endereco": end.strip(),
-        "cidade": format_city_uf(cidade, uf),
-    }
 
 def to_dt(d: str, h: str) -> datetime:
     return datetime.strptime(f"{d} {h}", "%Y-%m-%d %H:%M")
@@ -120,140 +162,120 @@ def to_dt(d: str, h: str) -> datetime:
 def overlap(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> bool:
     return max(a_start, b_start) < min(a_end, b_end)
 
-def jdump(obj: Any) -> str:
-    return json.dumps(obj, ensure_ascii=False, default=str)
-
-def jsafe_load(s: Optional[str]) -> Any:
-    if not s:
-        return None
+# ============================
+# DB (SQLite local OR Postgres via DB_URL in secrets)
+# ============================
+@st.cache_resource(show_spinner=False)
+def get_engine() -> Engine:
+    db_url = None
     try:
-        return json.loads(s)
+        db_url = st.secrets.get("DB_URL", None)
     except Exception:
-        return s
+        db_url = None
 
-# ----------------------------
-# DB helpers
-# ----------------------------
-def db() -> sqlite3.Connection:
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+    if db_url and str(db_url).strip():
+        return create_engine(str(db_url).strip(), pool_pre_ping=True)
+    return create_engine("sqlite:///concretagens.db", connect_args={"check_same_thread": False})
 
-def qdf(sql: str, params: Optional[list] = None) -> pd.DataFrame:
-    con = db()
-    try:
-        return pd.read_sql_query(sql, con, params=params or [])
-    finally:
-        con.close()
+metadata = MetaData()
 
-def qexec(sql: str, params: Optional[list] = None) -> int:
-    con = db()
-    cur = con.cursor()
-    try:
-        cur.execute(sql, params or [])
-        con.commit()
-        return cur.lastrowid
-    finally:
-        con.close()
+obras = Table(
+    "obras", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("nome", String(200), nullable=False),
+    Column("cliente", String(200)),
+    Column("endereco", String(300)),
+    Column("cidade", String(120)),
+    Column("responsavel", String(120)),
+    Column("telefone", String(80)),
+    Column("criado_em", String(19), nullable=False),
 
-def ensure_column(table: str, column: str, coltype: str):
-    con = db()
-    cur = con.cursor()
-    try:
-        cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
-        con.commit()
-    except Exception:
-        pass
-    finally:
-        con.close()
+    Column("cnpj", String(20)),
+    Column("razao_social", String(220)),
+    Column("nome_fantasia", String(220)),
+)
+
+users = Table(
+    "users", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("username", String(80), nullable=False, unique=True),
+    Column("name", String(120)),
+    Column("role", String(20), nullable=False),          # admin | user
+    Column("pass_salt", String(200), nullable=False),
+    Column("pass_hash", String(200), nullable=False),
+    Column("is_active", Boolean, nullable=False, server_default=text("1")),
+    Column("created_at", String(19), nullable=False),
+    Column("last_login_at", String(19)),
+)
+
+concretagens = Table(
+    "concretagens", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("obra_id", Integer, ForeignKey("obras.id"), nullable=False),
+    Column("data", String(10), nullable=False),          # YYYY-MM-DD
+    Column("hora_inicio", String(5), nullable=False),    # HH:MM
+    Column("duracao_min", Integer, nullable=False),
+    Column("volume_m3", Float, nullable=False),
+    Column("fck_mpa", Float),
+    Column("slump_mm", String(80)),
+    Column("usina", String(200)),
+    Column("bomba", String(120)),
+    Column("equipe", String(120)),
+    Column("status", String(20), nullable=False),
+    Column("observacoes", Text),
+
+    Column("criado_em", String(19), nullable=False),
+    Column("atualizado_em", String(19), nullable=False),
+    Column("criado_por", String(80)),
+    Column("alterado_por", String(80)),
+)
+
+historico = Table(
+    "historico_concretagens", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("concretagem_id", Integer, ForeignKey("concretagens.id"), nullable=False),
+    Column("acao", String(20), nullable=False),  # CREATE / UPDATE
+    Column("antes_json", Text),
+    Column("depois_json", Text),
+    Column("feito_por", String(80), nullable=False),
+    Column("feito_em", String(19), nullable=False),
+)
 
 def init_db():
-    con = db()
-    cur = con.cursor()
-
-    # Obras
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS obras (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        nome TEXT NOT NULL,
-        cliente TEXT,
-        endereco TEXT,
-        cidade TEXT,
-        responsavel TEXT,
-        telefone TEXT,
-        criado_em TEXT NOT NULL
-    )
-    """)
-
-
-    # Migração: garantir campos de CNPJ (sem quebrar instalações antigas)
-    ensure_column("obras", "cnpj", "TEXT")
-    ensure_column("obras", "razao_social", "TEXT")
-    ensure_column("obras", "nome_fantasia", "TEXT")
-    # Usuários (login)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT NOT NULL UNIQUE,
-        name TEXT,
-        role TEXT NOT NULL,              -- admin | user
-        pass_salt TEXT NOT NULL,
-        pass_hash TEXT NOT NULL,
-        is_active INTEGER NOT NULL DEFAULT 1,
-        created_at TEXT NOT NULL,
-        last_login_at TEXT
-    )
-    """)
-
-    # Concretagens + auditoria
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS concretagens (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        obra_id INTEGER NOT NULL,
-        data TEXT NOT NULL,                -- YYYY-MM-DD
-        hora_inicio TEXT NOT NULL,         -- HH:MM
-        duracao_min INTEGER NOT NULL,
-        volume_m3 REAL NOT NULL,
-        fck_mpa REAL,
-        slump_mm TEXT,
-        usina TEXT,
-        bomba TEXT,
-        equipe TEXT,
-        status TEXT NOT NULL,
-        observacoes TEXT,
-        criado_em TEXT NOT NULL,
-        atualizado_em TEXT NOT NULL,
-        criado_por TEXT,
-        alterado_por TEXT,
-        FOREIGN KEY (obra_id) REFERENCES obras(id)
-    )
-    """)
-
-    # Histórico de alterações (antes/depois)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS historico_concretagens (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        concretagem_id INTEGER NOT NULL,
-        acao TEXT NOT NULL,               -- CREATE / UPDATE / STATUS
-        antes_json TEXT,
-        depois_json TEXT,
-        feito_por TEXT NOT NULL,
-        feito_em TEXT NOT NULL,
-        FOREIGN KEY (concretagem_id) REFERENCES concretagens(id)
-    )
-    """)
-
-    con.commit()
-    con.close()
-
-    # Migrações defensivas (se DB já existia)
-    ensure_column("concretagens", "criado_por", "TEXT")
-    ensure_column("concretagens", "alterado_por", "TEXT")
-
-    # Garante admin padrão
+    eng = get_engine()
+    metadata.create_all(eng)
     ensure_default_admin()
 
-# ----------------------------
-# Segurança: hash senha (PBKDF2)
-# ----------------------------
+def df_from_rows(rows, cols) -> pd.DataFrame:
+    return pd.DataFrame(rows, columns=cols)
+
+def fetch_df(stmt) -> pd.DataFrame:
+    eng = get_engine()
+    with eng.connect() as conn:
+        res = conn.execute(stmt)
+        rows = res.fetchall()
+        cols = res.keys()
+    return df_from_rows(rows, cols)
+
+def exec_stmt(stmt) -> int:
+    eng = get_engine()
+    with eng.begin() as conn:
+        res = conn.execute(stmt)
+        try:
+            pk = res.inserted_primary_key
+            return int(pk[0]) if pk and pk[0] is not None else 0
+        except Exception:
+            return 0
+
+def fetch_one(stmt) -> Optional[Dict[str, Any]]:
+    df = fetch_df(stmt)
+    if df.empty:
+        return None
+    return df.iloc[0].to_dict()
+
+# ============================
+# Password hashing (PBKDF2)
+# ============================
 def _pbkdf2_hash(password: str, salt_b64: str) -> str:
     salt = base64.b64decode(salt_b64.encode("utf-8"))
     dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000)
@@ -268,51 +290,57 @@ def make_password(password: str) -> Tuple[str, str]:
 def verify_password(password: str, salt_b64: str, ph_b64: str) -> bool:
     return _pbkdf2_hash(password, salt_b64) == ph_b64
 
-# ----------------------------
-# Auth / Users
-# ----------------------------
+# ============================
+# Users / Auth
+# ============================
 def ensure_default_admin():
-    df = qdf("SELECT COUNT(*) AS n FROM users")
-    if int(df.iloc[0]["n"]) == 0:
+    df = fetch_df(select(users.c.id).limit(1))
+    if df.empty:
         salt, ph = make_password("admin123")
-        qexec("""INSERT INTO users (username, name, role, pass_salt, pass_hash, is_active, created_at)
-                 VALUES (?, ?, ?, ?, ?, 1, ?)""",
-              ["admin", "Administrador", "admin", salt, ph, now_iso()])
+        exec_stmt(insert(users).values(
+            username="admin", name="Administrador", role="admin",
+            pass_salt=salt, pass_hash=ph, is_active=True,
+            created_at=now_iso(), last_login_at=None
+        ))
 
 def get_user(username: str) -> Optional[Dict[str, Any]]:
-    df = qdf("SELECT * FROM users WHERE username=?", [username])
-    if df.empty:
-        return None
-    return df.iloc[0].to_dict()
+    return fetch_one(select(users).where(users.c.username == username))
 
 def list_users() -> pd.DataFrame:
-    return qdf("SELECT id, username, name, role, is_active, created_at, last_login_at FROM users ORDER BY id DESC")
+    return fetch_df(select(
+        users.c.id, users.c.username, users.c.name, users.c.role,
+        users.c.is_active, users.c.created_at, users.c.last_login_at
+    ).order_by(users.c.id.desc()))
 
 def create_user(username: str, name: str, role: str, password: str):
     salt, ph = make_password(password)
-    qexec("""INSERT INTO users (username, name, role, pass_salt, pass_hash, is_active, created_at)
-             VALUES (?, ?, ?, ?, ?, 1, ?)""",
-          [username, name, role, salt, ph, now_iso()])
+    exec_stmt(insert(users).values(
+        username=username, name=name, role=role,
+        pass_salt=salt, pass_hash=ph,
+        is_active=True, created_at=now_iso(), last_login_at=None
+    ))
 
 def set_user_active(user_id: int, active: bool):
-    qexec("UPDATE users SET is_active=? WHERE id=?", [1 if active else 0, int(user_id)])
+    eng = get_engine()
+    with eng.begin() as conn:
+        conn.execute(update(users).where(users.c.id == int(user_id)).values(is_active=bool(active)))
 
 def reset_user_password(user_id: int, new_password: str):
     salt, ph = make_password(new_password)
-    qexec("UPDATE users SET pass_salt=?, pass_hash=? WHERE id=?", [salt, ph, int(user_id)])
+    eng = get_engine()
+    with eng.begin() as conn:
+        conn.execute(update(users).where(users.c.id == int(user_id)).values(pass_salt=salt, pass_hash=ph))
 
 def update_last_login(username: str):
-    qexec("UPDATE users SET last_login_at=? WHERE username=?", [now_iso(), username])
+    eng = get_engine()
+    with eng.begin() as conn:
+        conn.execute(update(users).where(users.c.username == username).values(last_login_at=now_iso()))
 
 def current_user() -> str:
     return st.session_state.get("user", {}).get("username", "desconhecido")
 
 def current_role() -> str:
     return st.session_state.get("user", {}).get("role", "user")
-
-def require_login():
-    if not st.session_state.get("user"):
-        st.stop()
 
 def login_box():
     st.sidebar.markdown("### 🔐 Login")
@@ -322,16 +350,17 @@ def login_box():
     if st.session_state.user:
         st.sidebar.success(f"Logado: {st.session_state.user['username']}")
         st.sidebar.caption(f"Perfil: {st.session_state.user['role']}")
-        if st.sidebar.button("Sair"):
+        if st.sidebar.button("Sair", use_container_width=True):
             st.session_state.user = None
             st.rerun()
         return
 
     u = st.sidebar.text_input("Usuário", key="login_u")
     p = st.sidebar.text_input("Senha", type="password", key="login_p")
-    if st.sidebar.button("Entrar", use_container_width=True):
+
+    if st.sidebar.button("Entrar", use_container_width=True, type="primary"):
         user = get_user(u.strip())
-        if not user or int(user.get("is_active", 0)) != 1:
+        if not user or not bool(user.get("is_active", False)):
             st.sidebar.error("Usuário inválido ou inativo.")
             return
         if not verify_password(p, user["pass_salt"], user["pass_hash"]):
@@ -341,9 +370,68 @@ def login_box():
         update_last_login(user["username"])
         st.rerun()
 
-# ----------------------------
-# Regras de concretagem
-# ----------------------------
+def require_login():
+    if not st.session_state.get("user"):
+        st.stop()
+
+# ============================
+# CNPJ lookup (cnpj.ws)
+# ============================
+def only_digits(s: str) -> str:
+    return "".join(ch for ch in (s or "") if ch.isdigit())
+
+def fetch_cnpj_data(cnpj: str) -> Tuple[bool, str, Dict[str, Any]]:
+    cnpj_digits = only_digits(cnpj)
+    if len(cnpj_digits) != 14:
+        return False, "CNPJ inválido (precisa ter 14 dígitos).", {}
+
+    url = f"https://cnpj.ws/cnpj/{cnpj_digits}"
+    try:
+        r = requests.get(url, timeout=12)
+        if r.status_code != 200:
+            return False, f"Não foi possível consultar CNPJ (status {r.status_code}).", {}
+        data = r.json()
+    except Exception as e:
+        return False, f"Erro ao consultar CNPJ: {e}", {}
+
+    razao = data.get("razao_social") or ""
+    estab = data.get("estabelecimento") or {}
+    fantasia = estab.get("nome_fantasia") or ""
+
+    logradouro = estab.get("tipo_logradouro") or ""
+    nome_log = estab.get("logradouro") or ""
+    numero = estab.get("numero") or ""
+    bairro = estab.get("bairro") or ""
+    cep = estab.get("cep") or ""
+    cidade_obj = estab.get("cidade") or {}
+    estado_obj = estab.get("estado") or {}
+
+    cidade_nome = cidade_obj.get("nome") or ""
+    uf = estado_obj.get("sigla") or ""
+
+    endereco = " ".join([p for p in [logradouro, nome_log] if p]).strip()
+    if numero:
+        endereco = f"{endereco}, {numero}".strip(", ")
+    if bairro:
+        endereco = f"{endereco} - {bairro}".strip()
+    if cep:
+        endereco = f"{endereco} - CEP {cep}".strip()
+
+    cidade_fmt = " - ".join([p for p in [cidade_nome, uf] if p]).strip(" -")
+
+    payload = {
+        "cnpj": cnpj_digits,
+        "razao_social": razao,
+        "nome_fantasia": fantasia,
+        "endereco": endereco,
+        "cidade": cidade_fmt,
+        "cliente_sugerido": fantasia.strip() or razao.strip()
+    }
+    return True, "OK", payload
+
+# ============================
+# Concretagem helpers
+# ============================
 def calc_trucks(volume_m3: float, capacidade_m3: float = 8.0) -> int:
     if volume_m3 <= 0:
         return 0
@@ -351,15 +439,23 @@ def calc_trucks(volume_m3: float, capacidade_m3: float = 8.0) -> int:
     return int(math.ceil(volume_m3 / capacidade_m3))
 
 def default_duration_min(volume_m3: float) -> int:
-    # Regra simples: base 60 min + 12 min por caminhão (capacidade 8m³)
     trucks = calc_trucks(volume_m3, 8.0)
     return int(60 + trucks * 12)
 
-def get_obras() -> pd.DataFrame:
-    return qdf("SELECT id, nome, cliente, cnpj, razao_social, nome_fantasia, endereco, cidade, responsavel, telefone, criado_em FROM obras ORDER BY id DESC")
+def get_obras_df() -> pd.DataFrame:
+    return fetch_df(select(
+        obras.c.id, obras.c.nome, obras.c.cliente, obras.c.cidade,
+        obras.c.endereco, obras.c.responsavel, obras.c.telefone,
+        obras.c.cnpj, obras.c.razao_social, obras.c.nome_fantasia,
+        obras.c.criado_em
+    ).order_by(obras.c.id.desc()))
 
-def get_concretagens(range_start: date, range_end: date) -> pd.DataFrame:
-    return qdf("""
+def get_concretagens_df(range_start: date, range_end: date) -> pd.DataFrame:
+    ds = range_start.strftime("%Y-%m-%d")
+    de = range_end.strftime("%Y-%m-%d")
+
+    eng = get_engine()
+    sql = text("""
         SELECT c.id, c.data, c.hora_inicio, c.duracao_min, c.volume_m3, c.fck_mpa, c.slump_mm,
                c.usina, c.bomba, c.equipe, c.status,
                c.criado_por, c.alterado_por, c.criado_em, c.atualizado_em,
@@ -367,36 +463,43 @@ def get_concretagens(range_start: date, range_end: date) -> pd.DataFrame:
                c.observacoes
         FROM concretagens c
         JOIN obras o ON o.id = c.obra_id
-        WHERE c.data BETWEEN ? AND ?
+        WHERE c.data BETWEEN :ds AND :de
         ORDER BY c.data ASC, c.hora_inicio ASC
-    """, [range_start.strftime("%Y-%m-%d"), range_end.strftime("%Y-%m-%d")])
+    """)
+    with eng.connect() as conn:
+        df = pd.read_sql(sql, conn, params={"ds": ds, "de": de})
+    return df
 
 def get_concretagem_by_id(cid: int) -> Dict[str, Any]:
-    df = qdf("SELECT * FROM concretagens WHERE id=?", [int(cid)])
-    if df.empty:
-        return {}
-    return df.iloc[0].to_dict()
+    row = fetch_one(select(concretagens).where(concretagens.c.id == int(cid)))
+    return row or {}
 
 def add_history(concretagem_id: int, action: str, before: Any, after: Any, user: str):
-    qexec("""INSERT INTO historico_concretagens
-             (concretagem_id, acao, antes_json, depois_json, feito_por, feito_em)
-             VALUES (?, ?, ?, ?, ?, ?)""",
-          [int(concretagem_id), action, jdump(before) if before is not None else None, jdump(after) if after is not None else None, user, now_iso()])
+    exec_stmt(insert(historico).values(
+        concretagem_id=int(concretagem_id),
+        acao=action,
+        antes_json=json.dumps(before, ensure_ascii=False, default=str) if before is not None else None,
+        depois_json=json.dumps(after, ensure_ascii=False, default=str) if after is not None else None,
+        feito_por=user,
+        feito_em=now_iso()
+    ))
 
-def get_history(concretagem_id: int) -> pd.DataFrame:
-    return qdf("""
-        SELECT id, feito_em, feito_por, acao, antes_json, depois_json
-        FROM historico_concretagens
-        WHERE concretagem_id=?
-        ORDER BY id DESC
-    """, [int(concretagem_id)])
+def get_history_df(concretagem_id: int) -> pd.DataFrame:
+    return fetch_df(select(
+        historico.c.id, historico.c.feito_em, historico.c.feito_por, historico.c.acao,
+        historico.c.antes_json, historico.c.depois_json
+    ).where(historico.c.concretagem_id == int(concretagem_id)).order_by(historico.c.id.desc()))
 
 def find_conflicts(new_data: str, new_hora: str, new_dur: int, bomba: str, equipe: str, ignore_id: Optional[int] = None) -> List[Dict[str, Any]]:
-    df = qdf("""
+    active_status = ("Agendado", "Aguardando", "Confirmado", "Execucao")
+    eng = get_engine()
+    sql = text("""
         SELECT id, data, hora_inicio, duracao_min, bomba, equipe, status
         FROM concretagens
-        WHERE data = ? AND status IN ('Agendado','Confirmado','Execucao')
-    """, [new_data])
+        WHERE data = :d AND status IN :st
+    """)
+    with eng.connect() as conn:
+        df = pd.read_sql(sql, conn, params={"d": new_data, "st": active_status})
 
     ns = to_dt(new_data, new_hora)
     ne = ns + timedelta(minutes=int(new_dur))
@@ -440,33 +543,50 @@ def export_excel(df: pd.DataFrame) -> bytes:
         df.to_excel(writer, index=False, sheet_name="Agendamentos")
     return output.getvalue()
 
-# ----------------------------
-# UI
-# ----------------------------
+# ============================
+# App start
+# ============================
 st.set_page_config(page_title="Agendamentos de Concretagens", layout="wide")
+st.markdown(WIN11_CSS, unsafe_allow_html=True)
+
 init_db()
 
-st.title("📅 Agendamentos de Concretagens")
+st.markdown(
+    f"""
+    <div class="hab-card">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+        <div>
+          <div style="font-size:24px;font-weight:800;">📅 Agendamentos de Concretagens</div>
+          <div class="small-muted">Cloud-ready (Supabase/Postgres) • Auditoria • CNPJ automático • Layout Windows 11</div>
+        </div>
+        <div>
+          {status_chip("Agendado")} {status_chip("Aguardando")} {status_chip("Cancelado")}
+        </div>
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
 
 login_box()
 require_login()
 
-# Menu
 menu = st.sidebar.radio(
     "Menu",
     ["Dashboard", "Novo agendamento", "Agenda (lista)", "Obras", "Histórico", "Admin"],
     index=0
 )
 
-# Range padrão (semana atual)
 today = date.today()
 week_start = today - timedelta(days=today.weekday())
 week_end = week_start + timedelta(days=6)
 
-# ----------------------------
+# ============================
 # Dashboard
-# ----------------------------
+# ============================
 if menu == "Dashboard":
+    dfw = get_concretagens_df(week_start, week_end)
+
     colA, colB, colC = st.columns(3)
     with colA:
         st.metric("Hoje", today.strftime("%d/%m/%Y"))
@@ -475,17 +595,16 @@ if menu == "Dashboard":
     with colC:
         st.caption(f"Timezone: {TZ_LABEL}")
 
-    dfw = get_concretagens(week_start, week_end)
-
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Agendado", int((dfw["status"] == "Agendado").sum()) if not dfw.empty else 0)
-    c2.metric("Confirmado", int((dfw["status"] == "Confirmado").sum()) if not dfw.empty else 0)
-    c3.metric("Execução", int((dfw["status"] == "Execucao").sum()) if not dfw.empty else 0)
-    c4.metric("Concluído", int((dfw["status"] == "Concluido").sum()) if not dfw.empty else 0)
-    c5.metric("Cancelado", int((dfw["status"] == "Cancelado").sum()) if not dfw.empty else 0)
+    c2.metric("Aguardando", int((dfw["status"] == "Aguardando").sum()) if not dfw.empty else 0)
+    c3.metric("Confirmado", int((dfw["status"] == "Confirmado").sum()) if not dfw.empty else 0)
+    c4.metric("Execução", int((dfw["status"] == "Execucao").sum()) if not dfw.empty else 0)
+    c5.metric("Concluído", int((dfw["status"] == "Concluido").sum()) if not dfw.empty else 0)
+    c6.metric("Cancelado", int((dfw["status"] == "Cancelado").sum()) if not dfw.empty else 0)
 
     st.subheader("📌 Próximas concretagens (7 dias)")
-    df_next = get_concretagens(today, today + timedelta(days=7))
+    df_next = get_concretagens_df(today, today + timedelta(days=7))
     if df_next.empty:
         st.info("Nenhuma concretagem nos próximos 7 dias.")
     else:
@@ -493,135 +612,178 @@ if menu == "Dashboard":
             "data","hora_inicio","obra","cliente","cidade","volume_m3","fck_mpa","slump_mm",
             "usina","bomba","equipe","status","criado_por","alterado_por","atualizado_em"
         ]].copy()
-        st.dataframe(show, use_container_width=True, hide_index=True)
+        st.dataframe(style_status_df(show), use_container_width=True, hide_index=True)
 
-# ----------------------------
-# Obras
-# ----------------------------
+# ============================
+# Obras (Cadastrar + Editar) + CNPJ
+# ============================
 elif menu == "Obras":
-    st.subheader("🏗️ Obras")
+    st.subheader("🏗️ Cadastro de Obras")
 
-    col1, col2 = st.columns([1, 1])
+    mode = st.radio("Modo", ["Cadastrar", "Editar"], horizontal=True)
 
-    with col1:
-        st.markdown("### ➕ Cadastrar nova obra")
+    df_obras = get_obras_df()
 
-        # Aplica autopreenchimento (se houver) ANTES de criar qualquer widget desta seção
-        if "_prefill_obra" in st.session_state:
-            pf = st.session_state.pop("_prefill_obra") or {}
-            for k, v in pf.items():
-                st.session_state[k] = v
+    if mode == "Cadastrar":
+        st.markdown("#### ➕ Nova obra")
+        st.markdown('<div class="hab-card">', unsafe_allow_html=True)
 
+        cnpj_in = st.text_input("CNPJ (opcional)", value=st.session_state.get("obra_new_cnpj", ""))
 
-        # --- Autopreencher via CNPJ (fora do form) ---
-        st.markdown("#### 🔎 Autopreencher pelo CNPJ")
-        cnpj_in = st.text_input("CNPJ (opcional, para autopreencher)", key="obra_cnpj")
-        st.caption("Informe com ou sem pontuação. (API pública pode ter limite de consultas.)")
+        colx1, colx2 = st.columns([1, 1])
+        with colx1:
+            if st.button("🔎 Buscar dados pelo CNPJ", use_container_width=True, type="primary"):
+                ok, msg, payload = fetch_cnpj_data(cnpj_in)
+                if not ok:
+                    st.error(msg)
+                else:
+                    st.session_state["obra_new_cnpj"] = payload.get("cnpj", "")
+                    st.session_state["obra_new_cliente"] = payload.get("cliente_sugerido", "")
+                    st.session_state["obra_new_endereco"] = payload.get("endereco", "")
+                    st.session_state["obra_new_cidade"] = payload.get("cidade", "")
+                    st.session_state["obra_new_razao"] = payload.get("razao_social", "")
+                    st.session_state["obra_new_fantasia"] = payload.get("nome_fantasia", "")
+                    st.success("Dados carregados ✅")
+                    st.rerun()
+        with colx2:
+            st.caption("Consulta pública (limite por minuto).")
 
-        if st.button("🔎 Buscar dados pelo CNPJ", use_container_width=True):
-            cnpj_digits = only_digits(cnpj_in)
-            if len(cnpj_digits) != 14:
-                st.error("CNPJ inválido. Informe 14 dígitos (com ou sem pontuação).")
-            else:
-                try:
-                    payload = cnpjws_lookup(cnpj_digits)
-                    if payload is None:
-                        st.warning("CNPJ não encontrado.")
-                    else:
-                        fields = parse_cnpjws_to_fields(payload)
+        with st.form("form_obra_new", clear_on_submit=True):
+            nome = st.text_input("Nome da obra *")
+            cliente = st.text_input("Cliente (Razão/Nome fantasia)", value=st.session_state.get("obra_new_cliente", ""))
+            endereco = st.text_input("Endereço", value=st.session_state.get("obra_new_endereco", ""))
+            cidade = st.text_input("Cidade", value=st.session_state.get("obra_new_cidade", ""))
+            responsavel = st.text_input("Responsável")
+            telefone = st.text_input("Telefone/WhatsApp")
 
-                        # Preencher campos (antes de renderizar os inputs do form, evitando StreamlitAPIException)
-                        prefill = {
-                            "obra_cliente": (fields.get("nome_fantasia") or fields.get("razao_social") or "").strip(),
-                            "obra_endereco": (fields.get("endereco") or "").strip(),
-                            "obra_cidade": (fields.get("cidade") or "").strip(),
-                            "obra_razao_social": (fields.get("razao_social") or "").strip(),
-                            "obra_nome_fantasia": (fields.get("nome_fantasia") or "").strip(),
-                            "obra_cnpj": cnpj_digits,
-                        }
-                        # IMPORTANTE: não setar diretamente chaves de widgets após criados.
-                        # Guardamos em _prefill_obra e forçamos rerun; no topo da seção aplica antes dos inputs.
-                        st.session_state["_prefill_obra"] = prefill
+            st.caption("Campos trazidos do CNPJ (se aplicável):")
+            razao_social = st.text_input("Razão social", value=st.session_state.get("obra_new_razao", ""))
+            nome_fantasia = st.text_input("Nome fantasia", value=st.session_state.get("obra_new_fantasia", ""))
+            cnpj_clean = st.text_input("CNPJ (somente números)", value=only_digits(st.session_state.get("obra_new_cnpj", cnpj_in)))
 
-
-                        st.success("Dados carregados ✅ (confira e ajuste se precisar)")
-                        (st.rerun if hasattr(st, "rerun") else st.experimental_rerun)()
-                except RuntimeError as e:
-                    msg = str(e)
-                    if msg == "requests_not_installed":
-                        st.error("Dependência 'requests' não instalada. (No Cloud: inclua requests no requirements.txt).")
-                    elif msg == "rate_limit":
-                        st.warning("Limite de consultas atingido (API pública). Aguarde ~1 minuto e tente novamente.")
-                    elif msg.startswith("network_error"):
-                        st.error("Falha de rede ao consultar o CNPJ. Tente novamente.")
-                    else:
-                        st.error(f"Erro ao consultar CNPJ: {msg}")
-
-        st.divider()
-
-        with st.form("form_obra", clear_on_submit=False):
-            cA, cB = st.columns([1, 1])
-            with cA:
-                nome = st.text_input("Nome da obra *", key="obra_nome")
-            with cB:
-                cliente = st.text_input("Cliente", key="obra_cliente")
-
-            endereco = st.text_input("Endereço", key="obra_endereco")
-            cidade = st.text_input("Cidade", key="obra_cidade")
-            responsavel = st.text_input("Responsável", key="obra_responsavel")
-            telefone = st.text_input("Telefone/WhatsApp", key="obra_telefone")
-
-            ok = st.form_submit_button("💾 Salvar obra", use_container_width=True)
+            ok = st.form_submit_button("Salvar obra", use_container_width=True, type="primary")
             if ok:
-                if not (nome or "").strip():
+                if not nome.strip():
                     st.error("Informe o nome da obra.")
                 else:
-                    cnpj_digits = only_digits(cnpj_in)
-                    # Usa os campos extras preenchidos na busca (quando houver)
-                    razao = (st.session_state.get("obra_razao_social") or "").strip()
-                    fantasia = (st.session_state.get("obra_nome_fantasia") or "").strip()
-
-                    qexec(
-                        """INSERT INTO obras (nome, cliente, cnpj, razao_social, nome_fantasia, endereco, cidade, responsavel, telefone, criado_em)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        [
-                            (nome or "").strip(),
-                            (cliente or "").strip(),
-                            cnpj_digits if len(cnpj_digits) == 14 else "",
-                            razao,
-                            fantasia,
-                            (endereco or "").strip(),
-                            (cidade or "").strip(),
-                            (responsavel or "").strip(),
-                            (telefone or "").strip(),
-                            now_iso(),
-                        ],
-                    )
+                    exec_stmt(insert(obras).values(
+                        nome=nome.strip(),
+                        cliente=cliente.strip(),
+                        endereco=endereco.strip(),
+                        cidade=cidade.strip(),
+                        responsavel=responsavel.strip(),
+                        telefone=telefone.strip(),
+                        criado_em=now_iso(),
+                        cnpj=only_digits(cnpj_clean),
+                        razao_social=razao_social.strip(),
+                        nome_fantasia=nome_fantasia.strip()
+                    ))
+                    for k in list(st.session_state.keys()):
+                        if k.startswith("obra_new_"):
+                            st.session_state.pop(k, None)
                     st.success("Obra cadastrada ✅")
+                    st.rerun()
 
+        st.markdown('</div>', unsafe_allow_html=True)
 
-    with col2:
-        st.markdown("### 📚 Obras cadastradas")
-        df = get_obras()
-        st.dataframe(df, use_container_width=True, hide_index=True)
+    else:
+        st.markdown("#### ✏️ Editar obra")
+        if df_obras.empty:
+            st.info("Nenhuma obra cadastrada ainda.")
+        else:
+            labels = df_obras.apply(lambda r: f"#{r['id']} — {r['nome']} ({r.get('cliente','') or 'Sem cliente'})", axis=1).tolist()
+            pick = st.selectbox("Selecione a obra", labels)
+            obra_id = int(pick.split("—")[0].replace("#", "").strip())
 
-# ----------------------------
+            row = df_obras[df_obras["id"] == obra_id].iloc[0].to_dict()
+
+            st.markdown('<div class="hab-card">', unsafe_allow_html=True)
+
+            cnpj_edit = st.text_input("CNPJ", value=row.get("cnpj") or "", key=f"cnpj_edit_{obra_id}")
+
+            coly1, coly2 = st.columns([1, 1])
+            with coly1:
+                if st.button("🔎 Atualizar dados pelo CNPJ", use_container_width=True, key=f"btn_cnpj_edit_{obra_id}", type="primary"):
+                    ok, msg, payload = fetch_cnpj_data(cnpj_edit)
+                    if not ok:
+                        st.error(msg)
+                    else:
+                        st.session_state[f"edit_prefill_{obra_id}"] = payload
+                        st.success("Dados do CNPJ carregados ✅")
+                        st.rerun()
+            with coly2:
+                st.caption("Atualiza Cliente/Endereço/Cidade automaticamente.")
+
+            pre = st.session_state.get(f"edit_prefill_{obra_id}", {})
+            nome_val = row.get("nome") or ""
+            cliente_val = pre.get("cliente_sugerido") or (row.get("cliente") or "")
+            endereco_val = pre.get("endereco") or (row.get("endereco") or "")
+            cidade_val = pre.get("cidade") or (row.get("cidade") or "")
+            razao_val = pre.get("razao_social") or (row.get("razao_social") or "")
+            fantasia_val = pre.get("nome_fantasia") or (row.get("nome_fantasia") or "")
+            cnpj_val = pre.get("cnpj") or (row.get("cnpj") or "")
+
+            with st.form(f"form_obra_edit_{obra_id}"):
+                nome = st.text_input("Nome da obra *", value=nome_val)
+                cliente = st.text_input("Cliente (Razão/Nome fantasia)", value=cliente_val)
+                endereco = st.text_input("Endereço", value=endereco_val)
+                cidade = st.text_input("Cidade", value=cidade_val)
+                responsavel = st.text_input("Responsável", value=row.get("responsavel") or "")
+                telefone = st.text_input("Telefone/WhatsApp", value=row.get("telefone") or "")
+                razao_social = st.text_input("Razão social", value=razao_val)
+                nome_fantasia = st.text_input("Nome fantasia", value=fantasia_val)
+                cnpj_clean = st.text_input("CNPJ (somente números)", value=only_digits(cnpj_val))
+
+                salvar = st.form_submit_button("Salvar alterações", use_container_width=True, type="primary")
+                if salvar:
+                    if not nome.strip():
+                        st.error("Informe o nome da obra.")
+                    else:
+                        eng = get_engine()
+                        with eng.begin() as conn:
+                            conn.execute(update(obras).where(obras.c.id == obra_id).values(
+                                nome=nome.strip(),
+                                cliente=cliente.strip(),
+                                endereco=endereco.strip(),
+                                cidade=cidade.strip(),
+                                responsavel=responsavel.strip(),
+                                telefone=telefone.strip(),
+                                cnpj=only_digits(cnpj_clean),
+                                razao_social=razao_social.strip(),
+                                nome_fantasia=nome_fantasia.strip()
+                            ))
+                        st.session_state.pop(f"edit_prefill_{obra_id}", None)
+                        st.success("Obra atualizada ✅")
+                        st.rerun()
+
+            st.markdown('</div>', unsafe_allow_html=True)
+
+    st.divider()
+    st.markdown("#### 📚 Obras cadastradas")
+    df_obras = get_obras_df()
+    if df_obras.empty:
+        st.info("Nenhuma obra cadastrada.")
+    else:
+        show = df_obras[["id","nome","cliente","cidade","cnpj","endereco","responsavel","telefone","criado_em"]].copy()
+        st.dataframe(show, use_container_width=True, hide_index=True)
+
+# ============================
 # Novo agendamento
-# ----------------------------
+# ============================
 elif menu == "Novo agendamento":
     st.subheader("🧱 Novo agendamento de concretagem")
 
-    obras = get_obras()
-    if obras.empty:
+    df_obras = get_obras_df()
+    if df_obras.empty:
         st.warning("Cadastre uma obra primeiro (menu: Obras).")
     else:
-        obra_label = obras.apply(lambda r: f"#{r['id']} — {r['nome']} ({r.get('cliente','') or 'Sem cliente'})", axis=1).tolist()
-        obra_id_map = {obra_label[i]: int(obras.iloc[i]["id"]) for i in range(len(obras))}
+        labels = df_obras.apply(lambda r: f"#{r['id']} — {r['nome']} ({r.get('cliente','') or 'Sem cliente'})", axis=1).tolist()
+        id_map = {labels[i]: int(df_obras.iloc[i]["id"]) for i in range(len(labels))}
 
-        with st.form("form_conc", clear_on_submit=False):
-            obra_sel = st.selectbox("Obra *", obra_label)
+        st.markdown('<div class="hab-card">', unsafe_allow_html=True)
+        with st.form("form_conc_new"):
+            obra_sel = st.selectbox("Obra *", labels)
 
-            # (mobile-friendly) duas colunas no máximo
             cA, cB = st.columns(2)
             with cA:
                 d = st.date_input("Data *", value=today)
@@ -643,18 +805,18 @@ elif menu == "Novo agendamento":
             usina = st.text_input("Usina / Fornecedor", value="")
             bomba = st.text_input("Bomba (ID/placa/empresa)", value="")
             equipe = st.text_input("Equipe (ex: Equipe 1 / Técnico X)", value="")
-            status = st.selectbox("Status", STATUS, index=0)
+            status = st.selectbox("Status", STATUS, index=STATUS.index("Agendado"))
             obs = st.text_area("Observações", value="")
 
             cap = st.number_input("Capacidade caminhão (m³) p/ estimativa", min_value=4.0, value=8.0, step=0.5)
             st.caption(f"Estimativa: **{calc_trucks(volume, cap)} caminhões** (capacidade {cap} m³).")
 
-            salvar = st.form_submit_button("Salvar agendamento", use_container_width=True)
+            salvar = st.form_submit_button("Salvar agendamento", use_container_width=True, type="primary")
 
             if salvar:
                 data_str = d.strftime("%Y-%m-%d")
                 hora_str = h.strftime("%H:%M")
-                obra_id = obra_id_map[obra_sel]
+                obra_id = id_map[obra_sel]
 
                 conflicts = find_conflicts(data_str, hora_str, int(dur), bomba, equipe, ignore_id=None)
                 if conflicts:
@@ -665,24 +827,34 @@ elif menu == "Novo agendamento":
                 user = current_user()
                 now = now_iso()
 
-                new_id = qexec("""INSERT INTO concretagens
-                    (obra_id, data, hora_inicio, duracao_min, volume_m3, fck_mpa, slump_mm, usina, bomba, equipe,
-                     status, observacoes, criado_em, atualizado_em, criado_por, alterado_por)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    [obra_id, data_str, hora_str, int(dur), float(volume),
-                     float(fck) if fck else None, (slump or "").strip(),
-                     (usina or "").strip(), (bomba or "").strip(), (equipe or "").strip(),
-                     status, (obs or "").strip(),
-                     now, now, user, user]
-                )
+                new_id = exec_stmt(insert(concretagens).values(
+                    obra_id=obra_id,
+                    data=data_str,
+                    hora_inicio=hora_str,
+                    duracao_min=int(dur),
+                    volume_m3=float(volume),
+                    fck_mpa=float(fck) if fck else None,
+                    slump_mm=(slump or "").strip(),
+                    usina=(usina or "").strip(),
+                    bomba=(bomba or "").strip(),
+                    equipe=(equipe or "").strip(),
+                    status=status,
+                    observacoes=(obs or "").strip(),
+                    criado_em=now,
+                    atualizado_em=now,
+                    criado_por=user,
+                    alterado_por=user
+                ))
 
                 after = get_concretagem_by_id(new_id)
                 add_history(new_id, "CREATE", None, after, user)
                 st.success(f"Agendamento criado ✅ (ID {new_id})")
 
-# ----------------------------
+        st.markdown('</div>', unsafe_allow_html=True)
+
+# ============================
 # Agenda (lista) + editar
-# ----------------------------
+# ============================
 elif menu == "Agenda (lista)":
     st.subheader("📋 Agenda (lista)")
 
@@ -697,7 +869,7 @@ elif menu == "Agenda (lista)":
     st.markdown("##### Filtros")
     stt = st.multiselect("Status", STATUS, default=STATUS)
 
-    df = get_concretagens(ini, fim)
+    df = get_concretagens_df(ini, fim)
     if df.empty:
         st.info("Nada no período.")
     else:
@@ -720,16 +892,27 @@ elif menu == "Agenda (lista)":
             "volume_m3","fck_mpa","slump_mm","usina","bomba","equipe","status",
             "criado_por","alterado_por","atualizado_em","observacoes"
         ]
-        st.dataframe(df[view_cols], use_container_width=True, hide_index=True)
+        view = df[view_cols].copy()
+        st.dataframe(style_status_df(view), use_container_width=True, hide_index=True)
 
         st.divider()
         st.markdown("### ✏️ Editar agendamento")
-
         ids = df["id"].tolist()
         sel_id = st.selectbox("Selecione pelo ID", ids)
-        row = df[df["id"] == sel_id].iloc[0].to_dict()
 
-        # Form de edição
+        row = df[df["id"] == sel_id].iloc[0].to_dict()
+        st.markdown(
+            f"""
+            <div class="hab-card">
+              <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center;">
+                <div><b>ID {sel_id}</b> • {row.get('data')} {row.get('hora_inicio')} • <span class="small-muted">{row.get('obra')}</span></div>
+                <div>{status_chip(row.get('status'))}</div>
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
         with st.form("edit_form"):
             c1, c2 = st.columns(2)
             with c1:
@@ -757,11 +940,10 @@ elif menu == "Agenda (lista)":
 
             new_obs = st.text_area("Observações", value=str(row.get("observacoes") or ""))
 
-            salvar = st.form_submit_button("Salvar alterações", use_container_width=True)
+            salvar = st.form_submit_button("Salvar alterações", use_container_width=True, type="primary")
 
             if salvar:
-                before = get_concretagem_by_id(sel_id)
-
+                before = get_concretagem_by_id(int(sel_id))
                 data_str = str(before["data"])
                 hora_str = str(before["hora_inicio"])
 
@@ -772,37 +954,49 @@ elif menu == "Agenda (lista)":
                     st.stop()
 
                 user = current_user()
-                qexec("""UPDATE concretagens
-                        SET status=?, duracao_min=?, bomba=?, equipe=?, usina=?, slump_mm=?,
-                            volume_m3=?, fck_mpa=?, observacoes=?,
-                            atualizado_em=?, alterado_por=?
-                        WHERE id=?""",
-                      [new_status, int(new_dur),
-                       (new_bomba or "").strip(), (new_equipe or "").strip(),
-                       (new_usina or "").strip(), (new_slump or "").strip(),
-                       float(new_volume), float(new_fck) if new_fck else None,
-                       (new_obs or "").strip(),
-                       now_iso(), user, int(sel_id)])
+                now = now_iso()
 
-                after = get_concretagem_by_id(sel_id)
-                add_history(sel_id, "UPDATE", before, after, user)
+                eng = get_engine()
+                with eng.begin() as conn:
+                    conn.execute(update(concretagens).where(concretagens.c.id == int(sel_id)).values(
+                        status=new_status,
+                        duracao_min=int(new_dur),
+                        bomba=(new_bomba or "").strip(),
+                        equipe=(new_equipe or "").strip(),
+                        usina=(new_usina or "").strip(),
+                        slump_mm=(new_slump or "").strip(),
+                        volume_m3=float(new_volume),
+                        fck_mpa=float(new_fck) if new_fck else None,
+                        observacoes=(new_obs or "").strip(),
+                        atualizado_em=now,
+                        alterado_por=user
+                    ))
+
+                after = get_concretagem_by_id(int(sel_id))
+                add_history(int(sel_id), "UPDATE", before, after, user)
+
                 st.success("Atualizado ✅")
                 st.rerun()
 
-# ----------------------------
+# ============================
 # Histórico
-# ----------------------------
+# ============================
 elif menu == "Histórico":
     st.subheader("🧾 Histórico de alterações (auditoria)")
 
-    # Escolhe um ID existente recente
-    df_recent = qdf("""
-        SELECT c.id, c.data, c.hora_inicio, o.nome AS obra, c.status
-        FROM concretagens c
-        JOIN obras o ON o.id=c.obra_id
-        ORDER BY c.id DESC
-        LIMIT 200
-    """)
+    eng = get_engine()
+    with eng.connect() as conn:
+        df_recent = pd.read_sql(
+            text("""
+                SELECT c.id, c.data, c.hora_inicio, o.nome AS obra, c.status
+                FROM concretagens c
+                JOIN obras o ON o.id=c.obra_id
+                ORDER BY c.id DESC
+                LIMIT 200
+            """),
+            conn
+        )
+
     if df_recent.empty:
         st.info("Nenhum agendamento ainda.")
     else:
@@ -812,7 +1006,7 @@ elif menu == "Histórico":
         )
         sel_id = int(pick.split("—")[0].replace("ID", "").strip())
 
-        hist = get_history(sel_id)
+        hist = get_history_df(sel_id)
         if hist.empty:
             st.info("Sem histórico.")
         else:
@@ -821,14 +1015,20 @@ elif menu == "Histórico":
             with st.expander("Ver detalhes (antes/depois)", expanded=False):
                 for _, r in hist.iterrows():
                     st.markdown(f"**{r['feito_em']}** — {r['feito_por']} — `{r['acao']}`")
-                    a = jsafe_load(r["antes_json"])
-                    b = jsafe_load(r["depois_json"])
-                    st.code(jdump({"antes": a, "depois": b}), language="json")
+                    try:
+                        a = json.loads(r["antes_json"]) if r.get("antes_json") else None
+                    except Exception:
+                        a = r.get("antes_json")
+                    try:
+                        b = json.loads(r["depois_json"]) if r.get("depois_json") else None
+                    except Exception:
+                        b = r.get("depois_json")
+                    st.code(json.dumps({"antes": a, "depois": b}, ensure_ascii=False, indent=2), language="json")
                     st.divider()
 
-# ----------------------------
-# Admin (usuários + relatórios)
-# ----------------------------
+# ============================
+# Admin
+# ============================
 elif menu == "Admin":
     st.subheader("🛠️ Admin")
 
@@ -855,7 +1055,7 @@ elif menu == "Admin":
                 role = st.selectbox("Perfil", ["user", "admin"], index=0)
             with c4:
                 password = st.text_input("Senha *", type="password")
-            ok = st.form_submit_button("Criar", use_container_width=True)
+            ok = st.form_submit_button("Criar", use_container_width=True, type="primary")
 
             if ok:
                 if not username.strip() or not password:
@@ -875,7 +1075,7 @@ elif menu == "Admin":
 
             cA, cB = st.columns(2)
             with cA:
-                active = st.checkbox("Ativo", value=bool(int(row["is_active"])))
+                active = st.checkbox("Ativo", value=bool(row["is_active"]))
                 if st.button("Salvar ativo/inativo", use_container_width=True):
                     set_user_active(int(user_id), active)
                     st.success("Atualizado ✅")
@@ -895,7 +1095,7 @@ elif menu == "Admin":
             oldp = st.text_input("Senha atual", type="password")
             newp = st.text_input("Nova senha", type="password")
             newp2 = st.text_input("Confirmar nova senha", type="password")
-            ok = st.form_submit_button("Alterar", use_container_width=True)
+            ok = st.form_submit_button("Alterar", use_container_width=True, type="primary")
             if ok:
                 if newp != newp2:
                     st.error("Confirmação não confere.")
@@ -915,7 +1115,7 @@ elif menu == "Admin":
         with c2:
             fim = st.date_input("Até", value=week_end, key="fim_export")
 
-        df = get_concretagens(ini, fim)
+        df = get_concretagens_df(ini, fim)
         if df.empty:
             st.info("Nada no período.")
         else:
@@ -924,7 +1124,7 @@ elif menu == "Admin":
                 "volume_m3","fck_mpa","slump_mm","usina","bomba","equipe","status",
                 "criado_por","alterado_por","criado_em","atualizado_em","observacoes"
             ]].copy()
-            st.dataframe(rep, use_container_width=True, hide_index=True)
+            st.dataframe(style_status_df(rep), use_container_width=True, hide_index=True)
             xlsx = export_excel(rep)
             st.download_button(
                 "⬇️ Baixar Excel",
@@ -935,4 +1135,4 @@ elif menu == "Admin":
             )
 
 st.sidebar.divider()
-st.sidebar.caption("Auditoria ativa: criado_por / alterado_por + histórico antes/depois ✅")
+st.sidebar.caption("Cores: Agendado (azul) • Aguardando (amarelo) • Cancelado (vermelho) ✅")
