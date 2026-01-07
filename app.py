@@ -19,6 +19,13 @@ from datetime import datetime, date, time, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 
 import pandas as pd
+
+# HTTP (consulta CNPJ)
+try:
+    import requests
+except Exception:
+    requests = None
+
 import streamlit as st
 
 DB_PATH = "concretagens.db"
@@ -31,6 +38,81 @@ STATUS = ["Agendado", "Confirmado", "Execucao", "Concluido", "Cancelado"]
 # ----------------------------
 def now_iso() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def only_digits(s: str) -> str:
+    return "".join(ch for ch in (s or "") if ch.isdigit())
+
+def format_city_uf(city: str, uf: str) -> str:
+    city = (city or "").strip()
+    uf = (uf or "").strip()
+    if city and uf:
+        return f"{city} - {uf}"
+    return city or uf or ""
+
+@st.cache_data(ttl=60*60, show_spinner=False)
+def cnpjws_lookup(cnpj_digits: str):
+    """Consulta CNPJ na API pública do CNPJ.ws.
+    Retorna dict (JSON) ou None se não encontrado.
+    Pode lançar RuntimeError('rate_limit') em excesso de requisições.
+    """
+    if requests is None:
+        raise RuntimeError("requests_not_installed")
+
+    url = f"https://publica.cnpj.ws/cnpj/{cnpj_digits}"
+    try:
+        r = requests.get(
+            url,
+            timeout=15,
+            headers={"Accept": "application/json", "User-Agent": "Habisolute-Agendamentos/1.0"},
+        )
+    except Exception as e:
+        raise RuntimeError(f"network_error:{e}") from e
+
+    if r.status_code == 200:
+        try:
+            return r.json()
+        except Exception:
+            raise RuntimeError("invalid_json")
+    if r.status_code == 404:
+        return None
+    if r.status_code == 429:
+        raise RuntimeError("rate_limit")
+    raise RuntimeError(f"http_{r.status_code}")
+
+def parse_cnpjws_to_fields(payload: dict) -> dict:
+    """Extrai razão social, fantasia e endereço do JSON do CNPJ.ws."""
+    razao = (payload.get("razao_social") or "").strip()
+    est = payload.get("estabelecimento") or {}
+    fantasia = (est.get("nome_fantasia") or "").strip()
+
+    tipo_log = (est.get("tipo_logradouro") or "").strip()
+    logradouro = (est.get("logradouro") or "").strip()
+    numero = (est.get("numero") or "").strip()
+    complemento = (est.get("complemento") or "").strip()
+    bairro = (est.get("bairro") or "").strip()
+    cep = (est.get("cep") or "").strip()
+
+    cidade = ((est.get("cidade") or {}).get("nome") or "").strip() if isinstance(est.get("cidade"), dict) else ""
+    uf = ((est.get("estado") or {}).get("sigla") or "").strip() if isinstance(est.get("estado"), dict) else ""
+
+    rua = " ".join([p for p in [tipo_log, logradouro] if p]).strip()
+    end = rua
+    if numero:
+        end = f"{end}, {numero}" if end else numero
+    if complemento:
+        end = f"{end} - {complemento}" if end else complemento
+    if bairro:
+        end = f"{end} - {bairro}" if end else bairro
+    if cep:
+        end = f"{end} - CEP {cep}" if end else f"CEP {cep}"
+
+    return {
+        "razao_social": razao,
+        "nome_fantasia": fantasia,
+        "endereco": end.strip(),
+        "cidade": format_city_uf(cidade, uf),
+    }
 
 def to_dt(d: str, h: str) -> datetime:
     return datetime.strptime(f"{d} {h}", "%Y-%m-%d %H:%M")
@@ -101,6 +183,11 @@ def init_db():
     )
     """)
 
+
+    # Migração: garantir campos de CNPJ (sem quebrar instalações antigas)
+    ensure_column(con, "obras", "cnpj", "cnpj TEXT")
+    ensure_column(con, "obras", "razao_social", "razao_social TEXT")
+    ensure_column(con, "obras", "nome_fantasia", "nome_fantasia TEXT")
     # Usuários (login)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS users (
@@ -269,7 +356,7 @@ def default_duration_min(volume_m3: float) -> int:
     return int(60 + trucks * 12)
 
 def get_obras() -> pd.DataFrame:
-    return qdf("SELECT id, nome, cliente, cidade FROM obras ORDER BY id DESC")
+    return qdf("SELECT id, nome, cliente, cnpj, razao_social, nome_fantasia, endereco, cidade, responsavel, telefone, criado_em FROM obras ORDER BY id DESC")
 
 def get_concretagens(range_start: date, range_end: date) -> pd.DataFrame:
     return qdf("""
@@ -418,23 +505,89 @@ elif menu == "Obras":
 
     with col1:
         st.markdown("### ➕ Cadastrar nova obra")
-        with st.form("form_obra", clear_on_submit=True):
-            nome = st.text_input("Nome da obra *")
-            cliente = st.text_input("Cliente")
-            endereco = st.text_input("Endereço")
-            cidade = st.text_input("Cidade")
-            responsavel = st.text_input("Responsável")
-            telefone = st.text_input("Telefone/WhatsApp")
-            ok = st.form_submit_button("Salvar obra", use_container_width=True)
+        with st.form("form_obra", clear_on_submit=False):
+            # Usar keys para permitir autopreenchimento via CNPJ
+            cnpj_in = st.text_input("CNPJ (opcional, para autopreencher)", key="obra_cnpj")
+
+            cA, cB = st.columns([1, 1])
+            with cA:
+                nome = st.text_input("Nome da obra *", key="obra_nome")
+            with cB:
+                cliente = st.text_input("Cliente", key="obra_cliente")
+
+            endereco = st.text_input("Endereço", key="obra_endereco")
+            cidade = st.text_input("Cidade", key="obra_cidade")
+            responsavel = st.text_input("Responsável", key="obra_responsavel")
+            telefone = st.text_input("Telefone/WhatsApp", key="obra_telefone")
+
+            b1, b2 = st.columns([1, 1])
+            with b1:
+                buscar = st.form_submit_button("🔎 Buscar dados pelo CNPJ", use_container_width=True)
+            with b2:
+                ok = st.form_submit_button("💾 Salvar obra", use_container_width=True)
+
+            if buscar:
+                cnpj_digits = only_digits(cnpj_in)
+                if len(cnpj_digits) != 14:
+                    st.error("CNPJ inválido. Informe 14 dígitos (com ou sem pontuação).")
+                else:
+                    try:
+                        payload = cnpjws_lookup(cnpj_digits)
+                        if payload is None:
+                            st.warning("CNPJ não encontrado.")
+                        else:
+                            fields = parse_cnpjws_to_fields(payload)
+
+                            # Preencher campos (mantém o que o usuário já digitou, se estiver preenchido)
+                            st.session_state["obra_cliente"] = st.session_state.get("obra_cliente") or (fields["nome_fantasia"] or fields["razao_social"])
+                            st.session_state["obra_endereco"] = st.session_state.get("obra_endereco") or fields["endereco"]
+                            st.session_state["obra_cidade"] = st.session_state.get("obra_cidade") or fields["cidade"]
+
+                            # Campos extras (salvos no banco)
+                            st.session_state["obra_razao_social"] = fields["razao_social"]
+                            st.session_state["obra_nome_fantasia"] = fields["nome_fantasia"]
+                            st.session_state["obra_cnpj"] = cnpj_digits
+
+                            st.success("Dados carregados ✅ (confira e ajuste se precisar)")
+                            (st.rerun if hasattr(st, "rerun") else st.experimental_rerun)()
+                    except RuntimeError as e:
+                        msg = str(e)
+                        if msg == "requests_not_installed":
+                            st.error("Dependência 'requests' não instalada. (Local: pip install requests).")
+                        elif msg == "rate_limit":
+                            st.warning("Limite de consultas atingido (API pública). Aguarde ~1 minuto e tente novamente.")
+                        elif msg.startswith("network_error"):
+                            st.error("Falha de rede ao consultar o CNPJ. Tente novamente.")
+                        else:
+                            st.error(f"Erro ao consultar CNPJ: {msg}")
+
             if ok:
-                if not nome.strip():
+                if not (nome or "").strip():
                     st.error("Informe o nome da obra.")
                 else:
-                    qexec("""INSERT INTO obras (nome, cliente, endereco, cidade, responsavel, telefone, criado_em)
-                             VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                          [nome.strip(), cliente.strip(), endereco.strip(), cidade.strip(),
-                           responsavel.strip(), telefone.strip(), now_iso()])
+                    cnpj_digits = only_digits(cnpj_in)
+                    # Usa os campos extras preenchidos na busca (quando houver)
+                    razao = (st.session_state.get("obra_razao_social") or "").strip()
+                    fantasia = (st.session_state.get("obra_nome_fantasia") or "").strip()
+
+                    qexec(
+                        """INSERT INTO obras (nome, cliente, cnpj, razao_social, nome_fantasia, endereco, cidade, responsavel, telefone, criado_em)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        [
+                            (nome or "").strip(),
+                            (cliente or "").strip(),
+                            cnpj_digits if len(cnpj_digits) == 14 else "",
+                            razao,
+                            fantasia,
+                            (endereco or "").strip(),
+                            (cidade or "").strip(),
+                            (responsavel or "").strip(),
+                            (telefone or "").strip(),
+                            now_iso(),
+                        ],
+                    )
                     st.success("Obra cadastrada ✅")
+
 
     with col2:
         st.markdown("### 📚 Obras cadastradas")
