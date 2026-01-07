@@ -506,6 +506,13 @@ elif menu == "Obras":
     with col1:
         st.markdown("### ➕ Cadastrar nova obra")
 
+        # Aplica autopreenchimento (se houver) ANTES de criar qualquer widget desta seção
+        if "_prefill_obra" in st.session_state:
+            pf = st.session_state.pop("_prefill_obra") or {}
+            for k, v in pf.items():
+                st.session_state[k] = v
+
+
         # --- Autopreencher via CNPJ (fora do form) ---
         st.markdown("#### 🔎 Autopreencher pelo CNPJ")
         cnpj_in = st.text_input("CNPJ (opcional, para autopreencher)", key="obra_cnpj")
@@ -524,14 +531,18 @@ elif menu == "Obras":
                         fields = parse_cnpjws_to_fields(payload)
 
                         # Preencher campos (antes de renderizar os inputs do form, evitando StreamlitAPIException)
-                        st.session_state["obra_cliente"] = (fields.get("nome_fantasia") or fields.get("razao_social") or "").strip()
-                        st.session_state["obra_endereco"] = (fields.get("endereco") or "").strip()
-                        st.session_state["obra_cidade"] = (fields.get("cidade") or "").strip()
+                        prefill = {
+                            "obra_cliente": (fields.get("nome_fantasia") or fields.get("razao_social") or "").strip(),
+                            "obra_endereco": (fields.get("endereco") or "").strip(),
+                            "obra_cidade": (fields.get("cidade") or "").strip(),
+                            "obra_razao_social": (fields.get("razao_social") or "").strip(),
+                            "obra_nome_fantasia": (fields.get("nome_fantasia") or "").strip(),
+                            "obra_cnpj": cnpj_digits,
+                        }
+                        # IMPORTANTE: não setar diretamente chaves de widgets após criados.
+                        # Guardamos em _prefill_obra e forçamos rerun; no topo da seção aplica antes dos inputs.
+                        st.session_state["_prefill_obra"] = prefill
 
-                        # Campos extras (salvos no banco)
-                        st.session_state["obra_razao_social"] = (fields.get("razao_social") or "").strip()
-                        st.session_state["obra_nome_fantasia"] = (fields.get("nome_fantasia") or "").strip()
-                        st.session_state["obra_cnpj"] = cnpj_digits
 
                         st.success("Dados carregados ✅ (confira e ajuste se precisar)")
                         (st.rerun if hasattr(st, "rerun") else st.experimental_rerun)()
