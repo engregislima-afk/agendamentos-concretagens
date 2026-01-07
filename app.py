@@ -505,10 +505,50 @@ elif menu == "Obras":
 
     with col1:
         st.markdown("### ➕ Cadastrar nova obra")
-        with st.form("form_obra", clear_on_submit=False):
-            # Usar keys para permitir autopreenchimento via CNPJ
-            cnpj_in = st.text_input("CNPJ (opcional, para autopreencher)", key="obra_cnpj")
 
+        # --- Autopreencher via CNPJ (fora do form) ---
+        st.markdown("#### 🔎 Autopreencher pelo CNPJ")
+        cnpj_in = st.text_input("CNPJ (opcional, para autopreencher)", key="obra_cnpj")
+        st.caption("Informe com ou sem pontuação. (API pública pode ter limite de consultas.)")
+
+        if st.button("🔎 Buscar dados pelo CNPJ", use_container_width=True):
+            cnpj_digits = only_digits(cnpj_in)
+            if len(cnpj_digits) != 14:
+                st.error("CNPJ inválido. Informe 14 dígitos (com ou sem pontuação).")
+            else:
+                try:
+                    payload = cnpjws_lookup(cnpj_digits)
+                    if payload is None:
+                        st.warning("CNPJ não encontrado.")
+                    else:
+                        fields = parse_cnpjws_to_fields(payload)
+
+                        # Preencher campos (antes de renderizar os inputs do form, evitando StreamlitAPIException)
+                        st.session_state["obra_cliente"] = (fields.get("nome_fantasia") or fields.get("razao_social") or "").strip()
+                        st.session_state["obra_endereco"] = (fields.get("endereco") or "").strip()
+                        st.session_state["obra_cidade"] = (fields.get("cidade") or "").strip()
+
+                        # Campos extras (salvos no banco)
+                        st.session_state["obra_razao_social"] = (fields.get("razao_social") or "").strip()
+                        st.session_state["obra_nome_fantasia"] = (fields.get("nome_fantasia") or "").strip()
+                        st.session_state["obra_cnpj"] = cnpj_digits
+
+                        st.success("Dados carregados ✅ (confira e ajuste se precisar)")
+                        (st.rerun if hasattr(st, "rerun") else st.experimental_rerun)()
+                except RuntimeError as e:
+                    msg = str(e)
+                    if msg == "requests_not_installed":
+                        st.error("Dependência 'requests' não instalada. (No Cloud: inclua requests no requirements.txt).")
+                    elif msg == "rate_limit":
+                        st.warning("Limite de consultas atingido (API pública). Aguarde ~1 minuto e tente novamente.")
+                    elif msg.startswith("network_error"):
+                        st.error("Falha de rede ao consultar o CNPJ. Tente novamente.")
+                    else:
+                        st.error(f"Erro ao consultar CNPJ: {msg}")
+
+        st.divider()
+
+        with st.form("form_obra", clear_on_submit=False):
             cA, cB = st.columns([1, 1])
             with cA:
                 nome = st.text_input("Nome da obra *", key="obra_nome")
@@ -520,47 +560,7 @@ elif menu == "Obras":
             responsavel = st.text_input("Responsável", key="obra_responsavel")
             telefone = st.text_input("Telefone/WhatsApp", key="obra_telefone")
 
-            b1, b2 = st.columns([1, 1])
-            with b1:
-                buscar = st.form_submit_button("🔎 Buscar dados pelo CNPJ", use_container_width=True)
-            with b2:
-                ok = st.form_submit_button("💾 Salvar obra", use_container_width=True)
-
-            if buscar:
-                cnpj_digits = only_digits(cnpj_in)
-                if len(cnpj_digits) != 14:
-                    st.error("CNPJ inválido. Informe 14 dígitos (com ou sem pontuação).")
-                else:
-                    try:
-                        payload = cnpjws_lookup(cnpj_digits)
-                        if payload is None:
-                            st.warning("CNPJ não encontrado.")
-                        else:
-                            fields = parse_cnpjws_to_fields(payload)
-
-                            # Preencher campos (mantém o que o usuário já digitou, se estiver preenchido)
-                            st.session_state["obra_cliente"] = st.session_state.get("obra_cliente") or (fields["nome_fantasia"] or fields["razao_social"])
-                            st.session_state["obra_endereco"] = st.session_state.get("obra_endereco") or fields["endereco"]
-                            st.session_state["obra_cidade"] = st.session_state.get("obra_cidade") or fields["cidade"]
-
-                            # Campos extras (salvos no banco)
-                            st.session_state["obra_razao_social"] = fields["razao_social"]
-                            st.session_state["obra_nome_fantasia"] = fields["nome_fantasia"]
-                            st.session_state["obra_cnpj"] = cnpj_digits
-
-                            st.success("Dados carregados ✅ (confira e ajuste se precisar)")
-                            (st.rerun if hasattr(st, "rerun") else st.experimental_rerun)()
-                    except RuntimeError as e:
-                        msg = str(e)
-                        if msg == "requests_not_installed":
-                            st.error("Dependência 'requests' não instalada. (Local: pip install requests).")
-                        elif msg == "rate_limit":
-                            st.warning("Limite de consultas atingido (API pública). Aguarde ~1 minuto e tente novamente.")
-                        elif msg.startswith("network_error"):
-                            st.error("Falha de rede ao consultar o CNPJ. Tente novamente.")
-                        else:
-                            st.error(f"Erro ao consultar CNPJ: {msg}")
-
+            ok = st.form_submit_button("💾 Salvar obra", use_container_width=True)
             if ok:
                 if not (nome or "").strip():
                     st.error("Informe o nome da obra.")
