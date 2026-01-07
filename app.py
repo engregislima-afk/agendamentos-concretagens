@@ -185,9 +185,9 @@ def init_db():
 
 
     # Migração: garantir campos de CNPJ (sem quebrar instalações antigas)
-    ensure_column(con, "obras", "cnpj", "cnpj TEXT")
-    ensure_column(con, "obras", "razao_social", "razao_social TEXT")
-    ensure_column(con, "obras", "nome_fantasia", "nome_fantasia TEXT")
+    ensure_column("obras", "cnpj", "TEXT")
+    ensure_column("obras", "razao_social", "TEXT")
+    ensure_column("obras", "nome_fantasia", "TEXT")
     # Usuários (login)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS users (
