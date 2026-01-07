@@ -17,6 +17,7 @@ import json
 import base64
 import hashlib
 import secrets
+import urllib.parse
 from datetime import datetime, date, time, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -174,7 +175,11 @@ def get_engine() -> Engine:
         db_url = None
 
     if db_url and str(db_url).strip():
-        return create_engine(str(db_url).strip(), pool_pre_ping=True)
+        url = _ensure_sslmode_require(str(db_url).strip())
+        # pool_pre_ping evita conexões "mortas"
+        return create_engine(url, pool_pre_ping=True)
+
+    # Local
     return create_engine("sqlite:///concretagens.db", connect_args={"check_same_thread": False})
 
 metadata = MetaData()
@@ -243,6 +248,39 @@ historico = Table(
 
 def init_db():
     eng = get_engine()
+    # Testa conexão antes de tentar criar tabelas (evita crash "mudo" no Cloud)
+    try:
+        with eng.connect() as conn:
+            conn.execute(text("SELECT 1"))
+    except Exception as e:
+        st.error("❌ Não consegui conectar no banco Postgres (Supabase).")
+        host = ""
+        try:
+            raw = None
+            try:
+                raw = st.secrets.get("DB_URL", None)
+            except Exception:
+                raw = None
+            if raw:
+                host = _safe_db_host(_ensure_sslmode_require(str(raw).strip()))
+        except Exception:
+            host = ""
+        if host:
+            st.caption(f"Host do DB (sem senha): {host}")
+        st.markdown("""
+**Como corrigir (2 minutos):**
+1) No Streamlit Cloud → **Manage app → Settings → Secrets**
+2) Garanta que seu TOML tenha a linha:
+```toml
+DB_URL="postgresql://usuario:SENHA@HOST:PORT/DB?sslmode=require"
+```
+3) Se sua senha tem caracteres especiais (ex: `@ # : /`), use a string do botão **Connect** do Supabase (Pooler/Supavisor), ou faça URL-encode desses caracteres.
+4) Clique em **Save** e depois **Reboot** no app.
+
+Se preferir, use o **Pooler (Supavisor)** no Supabase → Connect (recomendado para apps em nuvem).
+""")
+        st.stop()
+
     metadata.create_all(eng)
     ensure_default_admin()
 
