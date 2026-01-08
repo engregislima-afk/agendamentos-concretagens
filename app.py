@@ -166,6 +166,30 @@ def overlap(a_start: datetime, a_end: datetime, b_start: datetime, b_end: dateti
 # ============================
 # DB (SQLite local OR Postgres via DB_URL in secrets)
 # ============================
+
+def _ensure_sslmode_require(db_url: str) -> str:
+    """Supabase Postgres requires SSL. If sslmode is not present, append sslmode=require."""
+    if not db_url:
+        return db_url
+    u = db_url.strip()
+    if u.startswith("postgresql://") or u.startswith("postgres://"):
+        if "sslmode=" in u:
+            return u
+        joiner = "&" if "?" in u else "?"
+        return u + f"{joiner}sslmode=require"
+    return u
+
+def _safe_db_host(db_url: str) -> str:
+    """Return a redacted host string for debugging without leaking credentials."""
+    try:
+        pr = urllib.parse.urlparse(db_url)
+        host = pr.hostname or ""
+        port = pr.port or ""
+        return f"{host}:{port}" if port else host
+    except Exception:
+        return ""
+
+
 @st.cache_resource(show_spinner=False)
 def get_engine() -> Engine:
     db_url = None
