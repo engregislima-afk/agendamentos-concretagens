@@ -278,6 +278,7 @@ def init_db():
             conn.execute(text("SELECT 1"))
     except Exception as e:
         st.error("❌ Não consegui conectar no banco Postgres (Supabase).")
+        st.caption(f"Detalhe técnico: {type(e).__name__}: {str(e)[:300]}")
         host = ""
         try:
             raw = None
@@ -301,7 +302,7 @@ DB_URL="postgresql://usuario:SENHA@HOST:PORT/DB?sslmode=require"
 3) Se sua senha tem caracteres especiais (ex: `@ # : /`), use a string do botão **Connect** do Supabase (Pooler/Supavisor), ou faça URL-encode desses caracteres.
 4) Clique em **Save** e depois **Reboot** no app.
 
-Se preferir, use o **Pooler (Supavisor)** no Supabase → Connect (recomendado para apps em nuvem).
+Se preferir, use o **Pooler (Supavisor)** no Supabase → Connect (recomendado para apps em nuvem).\n\n**Dica prática (resolve 90% dos casos no Streamlit Cloud):**\n- No Supabase → *Connect* → copie a string **Transaction pooler** (ou Session pooler)\n- Cole no DB_URL do Secrets (ela costuma usar host do tipo `aws-...pooler.supabase.com` e porta `6543`)\n
 """)
         st.stop()
 
