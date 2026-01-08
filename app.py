@@ -18,6 +18,13 @@ import base64
 import hashlib
 import secrets
 import urllib.parse
+import socket
+
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
+
 from datetime import datetime, date, time, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -28,7 +35,7 @@ import streamlit as st
 from sqlalchemy import (
     create_engine, MetaData, Table, Column,
     Integer, String, Float, Text, ForeignKey, Boolean,
-    select, insert, update, text
+    select, insert, update, text, and_, or_
 )
 from sqlalchemy.engine import Engine
 
@@ -154,8 +161,20 @@ def style_status_df(df: pd.DataFrame) -> "pd.io.formats.style.Styler":
 # ============================
 # Time helpers
 # ============================
+def _local_now() -> datetime:
+    """Return 'now' in the configured timezone (fallback to naive local time)."""
+    if ZoneInfo is not None:
+        try:
+            return datetime.now(ZoneInfo(TZ_LABEL))
+        except Exception:
+            pass
+    return datetime.now()
+
+def today_local() -> date:
+    return _local_now().date()
+
 def now_iso() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return _local_now().strftime("%Y-%m-%d %H:%M:%S")
 
 def to_dt(d: str, h: str) -> datetime:
     return datetime.strptime(f"{d} {h}", "%Y-%m-%d %H:%M")
@@ -192,84 +211,79 @@ def _safe_db_host(db_url: str) -> str:
 
 @st.cache_resource(show_spinner=False)
 def get_engine() -> Engine:
+    """Cria e cacheia o Engine SQLAlchemy (SQLite local ou Postgres via secrets/env).
+
+    Melhorias incluídas:
+    - fallback para variáveis de ambiente (DB_URL/DATABASE_URL)
+    - pool_pre_ping/pool_recycle para conexões mais estáveis
+    - opcional: força resolução IPv4 (útil em alguns Windows/DNS) quando psycopg2 estiver disponível
+    """
+    # 1) Fonte da URL do banco
     db_url = None
     try:
-        db_url = st.secrets.get("DB_URL", None)
+        db_url = st.secrets.get("db_url")
     except Exception:
         db_url = None
 
-    if db_url and str(db_url).strip():
-        url = _ensure_sslmode_require(str(db_url).strip())
-        # pool_pre_ping evita conexões "mortas"
-        return create_engine(url, pool_pre_ping=True)
+    if not db_url:
+        db_url = os.environ.get("DB_URL") or os.environ.get("DATABASE_URL")
 
-    # Local
-    return create_engine("sqlite:///concretagens.db", connect_args={"check_same_thread": False})
+    # 2) Se tiver URL explícita, usa-a
+    if db_url:
+        db_url = db_url.strip()
+        if db_url.startswith("postgres"):
+            db_url = _ensure_sslmode_require(db_url)
 
-metadata = MetaData()
+            # --- opcional: forçar IPv4 via creator (reduz falhas DNS/IPv6 em alguns ambientes) ---
+            force_ipv4 = os.environ.get("HABI_FORCE_IPV4", "1").strip().lower() not in ("0", "false", "no")
+            if force_ipv4:
+                try:
+                    import psycopg2  # type: ignore
+                    u = urllib.parse.urlparse(db_url)
+                    host = u.hostname or ""
+                    port = int(u.port or 5432)
 
-obras = Table(
-    "obras", metadata,
-    Column("id", Integer, primary_key=True, autoincrement=True),
-    Column("nome", String(200), nullable=False),
-    Column("cliente", String(200)),
-    Column("endereco", String(300)),
-    Column("cidade", String(120)),
-    Column("responsavel", String(120)),
-    Column("telefone", String(80)),
-    Column("criado_em", String(19), nullable=False),
+                    ipv4 = None
+                    for res in socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM):
+                        ipv4 = res[4][0]
+                        break
 
-    Column("cnpj", String(20)),
-    Column("razao_social", String(220)),
-    Column("nome_fantasia", String(220)),
-)
+                    if ipv4:
+                        user = urllib.parse.unquote(u.username or "")
+                        pwd = urllib.parse.unquote(u.password or "")
+                        dbname = (u.path or "").lstrip("/")
+                        q = dict(urllib.parse.parse_qsl(u.query))
+                        sslmode = q.get("sslmode", "require")
 
-users = Table(
-    "users", metadata,
-    Column("id", Integer, primary_key=True, autoincrement=True),
-    Column("username", String(80), nullable=False, unique=True),
-    Column("name", String(120)),
-    Column("role", String(20), nullable=False),          # admin | user
-    Column("pass_salt", String(200), nullable=False),
-    Column("pass_hash", String(200), nullable=False),
-    Column("is_active", Boolean, nullable=False, server_default=text("1")),
-    Column("created_at", String(19), nullable=False),
-    Column("last_login_at", String(19)),
-)
+                        def _creator():
+                            return psycopg2.connect(
+                                dbname=dbname,
+                                user=user,
+                                password=pwd,
+                                host=ipv4,
+                                port=port,
+                                sslmode=sslmode,
+                            )
 
-concretagens = Table(
-    "concretagens", metadata,
-    Column("id", Integer, primary_key=True, autoincrement=True),
-    Column("obra_id", Integer, ForeignKey("obras.id"), nullable=False),
-    Column("data", String(10), nullable=False),          # YYYY-MM-DD
-    Column("hora_inicio", String(5), nullable=False),    # HH:MM
-    Column("duracao_min", Integer, nullable=False),
-    Column("volume_m3", Float, nullable=False),
-    Column("fck_mpa", Float),
-    Column("slump_mm", String(80)),
-    Column("usina", String(200)),
-    Column("bomba", String(120)),
-    Column("equipe", String(120)),
-    Column("status", String(20), nullable=False),
-    Column("observacoes", Text),
+                        return create_engine(
+                            db_url,
+                            future=True,
+                            pool_pre_ping=True,
+                            pool_recycle=3600,
+                            creator=_creator,
+                        )
+                except Exception:
+                    pass
 
-    Column("criado_em", String(19), nullable=False),
-    Column("atualizado_em", String(19), nullable=False),
-    Column("criado_por", String(80)),
-    Column("alterado_por", String(80)),
-)
+            return create_engine(db_url, future=True, pool_pre_ping=True, pool_recycle=3600)
 
-historico = Table(
-    "historico_concretagens", metadata,
-    Column("id", Integer, primary_key=True, autoincrement=True),
-    Column("concretagem_id", Integer, ForeignKey("concretagens.id"), nullable=False),
-    Column("acao", String(20), nullable=False),  # CREATE / UPDATE
-    Column("antes_json", Text),
-    Column("depois_json", Text),
-    Column("feito_por", String(80), nullable=False),
-    Column("feito_em", String(19), nullable=False),
-)
+        # SQLite ou outro driver
+        if db_url.startswith("sqlite"):
+            return create_engine(db_url, future=True, connect_args={"check_same_thread": False})
+        return create_engine(db_url, future=True, pool_pre_ping=True)
 
+    # 3) Padrão local (SQLite)
+    return create_engine("sqlite:///agendamentos.db", future=True, connect_args={"check_same_thread": False})
 def init_db():
     eng = get_engine()
     # Testa conexão antes de tentar criar tabelas (evita crash "mudo" no Cloud)
@@ -553,52 +567,72 @@ def get_history_df(concretagem_id: int) -> pd.DataFrame:
         historico.c.antes_json, historico.c.depois_json
     ).where(historico.c.concretagem_id == int(concretagem_id)).order_by(historico.c.id.desc()))
 
-def find_conflicts(new_data: str, new_hora: str, new_dur: int, bomba: str, equipe: str, ignore_id: Optional[int] = None) -> List[Dict[str, Any]]:
+def find_conflicts(
+    new_data: str,
+    new_hora: str,
+    new_dur: int,
+    bomba: str,
+    equipe: str,
+    ignore_id: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Procura conflitos de agenda (sobreposição de horários) para o MESMO recurso (bomba/equipe).
+
+    Observação: considera como 'ativos' os status que ainda podem conflitar:
+    Agendado, Aguardando, Confirmado e Execucao.
+    """
+    inicio = to_time(new_hora)
+    fim = (datetime.combine(date(2000, 1, 1), inicio) + timedelta(minutes=int(new_dur))).time()
+
     active_status = ("Agendado", "Aguardando", "Confirmado", "Execucao")
-    eng = get_engine()
-    sql = text("""
-        SELECT id, data, hora_inicio, duracao_min, bomba, equipe, status
-        FROM concretagens
-        WHERE data = :d AND status IN :st
-    """)
-    with eng.connect() as conn:
-        df = pd.read_sql(sql, conn, params={"d": new_data, "st": active_status})
 
-    ns = to_dt(new_data, new_hora)
-    ne = ns + timedelta(minutes=int(new_dur))
+    conds = [
+        concretagens.c.data == new_data,
+        concretagens.c.status.in_(active_status),
+        concretagens.c.hora_inicio < fim,
+        concretagens.c.hora_fim > inicio,
+    ]
+    if ignore_id is not None:
+        conds.append(concretagens.c.id != int(ignore_id))
 
-    bomba = (bomba or "").strip().lower()
-    equipe = (equipe or "").strip().lower()
+    # Restringe por recurso quando informado (bomba/equipe)
+    resource_conds = []
+    if bomba and str(bomba).strip():
+        resource_conds.append(concretagens.c.bomba == bomba)
+    if equipe and str(equipe).strip():
+        resource_conds.append(concretagens.c.equipe == equipe)
+    if resource_conds:
+        conds.append(or_(*resource_conds))
 
-    conflicts = []
-    for _, r in df.iterrows():
-        rid = int(r["id"])
-        if ignore_id is not None and rid == int(ignore_id):
-            continue
+    stmt = (
+        select(
+            concretagens.c.id,
+            obras.c.nome.label("obra"),
+            concretagens.c.hora_inicio,
+            concretagens.c.hora_fim,
+            concretagens.c.status,
+            concretagens.c.bomba,
+            concretagens.c.equipe,
+        )
+        .select_from(concretagens.join(obras, concretagens.c.obra_id == obras.c.id))
+        .where(and_(*conds))
+        .order_by(concretagens.c.hora_inicio.asc())
+    )
 
-        rs = to_dt(str(r["data"]), str(r["hora_inicio"]))
-        re = rs + timedelta(minutes=int(r["duracao_min"]))
+    with get_engine().connect() as conn:
+        rows = conn.execute(stmt).mappings().all()
 
-        rb = (str(r["bomba"] or "")).strip().lower()
-        rq = (str(r["equipe"] or "")).strip().lower()
-
-        same_resource = False
-        if bomba and rb:
-            same_resource = same_resource or (bomba == rb)
-        if equipe and rq:
-            same_resource = same_resource or (equipe == rq)
-
-        if same_resource and overlap(ns, ne, rs, re):
-            conflicts.append({
-                "id": rid,
-                "inicio": rs.strftime("%H:%M"),
-                "fim": re.strftime("%H:%M"),
-                "bomba": r["bomba"],
-                "equipe": r["equipe"],
-                "status": r["status"],
-            })
-    return conflicts
-
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        out.append({
+            "id": r["id"],
+            "obra": r["obra"],
+            "hora_inicio": r["hora_inicio"],
+            "hora_fim": r["hora_fim"],
+            "status": r["status"],
+            "bomba": r["bomba"],
+            "equipe": r["equipe"],
+        })
+    return out
 def export_excel(df: pd.DataFrame) -> bytes:
     import io
     output = io.BytesIO()
@@ -636,11 +670,11 @@ require_login()
 
 menu = st.sidebar.radio(
     "Menu",
-    ["Dashboard", "Novo agendamento", "Agenda (lista)", "Obras", "Histórico", "Admin"],
+    ["Dashboard", "Agenda (calendário)", "Novo agendamento", "Agenda (lista)", "Obras", "Histórico", "Admin"],
     index=0
 )
 
-today = date.today()
+today = today_local()
 week_start = today - timedelta(days=today.weekday())
 week_end = week_start + timedelta(days=6)
 
@@ -833,6 +867,113 @@ elif menu == "Obras":
 # ============================
 # Novo agendamento
 # ============================
+
+elif menu == "Agenda (calendário)":
+    st.subheader("📅 Agenda (calendário semanal)")
+
+    colw1, colw2, colw3 = st.columns([1.2, 1.0, 1.0])
+    with colw1:
+        ref_day = st.date_input(
+            "Semana de referência",
+            value=today,
+            help="Selecione qualquer dia da semana que deseja visualizar."
+        )
+    week_start_cal = ref_day - timedelta(days=ref_day.weekday())
+    week_end_cal = week_start_cal + timedelta(days=6)
+
+    with colw2:
+        show_done = st.checkbox("Mostrar concluídos/cancelados", value=False)
+    with colw3:
+        compact = st.checkbox("Modo compacto", value=True)
+
+    obras_df = get_obras_df()
+    obra_opts = obras_df["nome"].tolist() if not obras_df.empty else []
+    obra_sel = st.multiselect("Filtrar por obras (opcional)", options=obra_opts, default=[])
+
+    default_status = ["Agendado", "Aguardando", "Confirmado", "Execucao"] if not show_done else STATUS
+    status_sel = st.multiselect("Status", options=STATUS, default=default_status)
+
+    df_week = get_concretagens_df(week_start_cal.isoformat(), week_end_cal.isoformat())
+    if not df_week.empty:
+        if obra_sel:
+            df_week = df_week[df_week["obra"].isin(obra_sel)].copy()
+        if status_sel:
+            df_week = df_week[df_week["status"].isin(status_sel)].copy()
+
+    st.caption(
+        f"Período: {week_start_cal.strftime('%d/%m/%Y')} a {week_end_cal.strftime('%d/%m/%Y')} ({TZ_LABEL})"
+    )
+
+    if df_week.empty:
+        st.info("Nenhum agendamento encontrado para os filtros selecionados.")
+    else:
+        # Pré-calcular conflitos por dia (sobreposição e mesmo recurso bomba/equipe)
+        conflicts_ids: set[int] = set()
+
+        def _hhmm(s: str) -> str:
+            s = str(s or "")
+            return s[:5] if len(s) >= 5 else s
+
+        for d, g in df_week.groupby("data"):
+            g2 = g.copy()
+            g2 = g2[g2["status"].isin(["Agendado", "Aguardando", "Confirmado", "Execucao"])]
+            g2 = g2.sort_values(by=["hora_inicio", "hora_fim"])
+            rows = g2.to_dict("records")
+
+            for i in range(len(rows)):
+                for j in range(i + 1, len(rows)):
+                    a = rows[i]
+                    b = rows[j]
+                    ai = to_time(a["hora_inicio"])
+                    af = to_time(a["hora_fim"])
+                    bi = to_time(b["hora_inicio"])
+                    bf = to_time(b["hora_fim"])
+
+                    same_resource = False
+                    if str(a.get("bomba") or "").strip() and a.get("bomba") == b.get("bomba"):
+                        same_resource = True
+                    if str(a.get("equipe") or "").strip() and a.get("equipe") == b.get("equipe"):
+                        same_resource = True
+
+                    if same_resource and intervals_overlap(ai, af, bi, bf):
+                        conflicts_ids.add(int(a["id"]))
+                        conflicts_ids.add(int(b["id"]))
+
+        dow = ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]
+        cols = st.columns(7, gap="small")
+
+        for k in range(7):
+            day = week_start_cal + timedelta(days=k)
+            day_key = day.isoformat()
+            day_df = df_week[df_week["data"] == day_key].copy()
+            day_df = day_df.sort_values(by=["hora_inicio", "hora_fim"])
+
+            with cols[k]:
+                st.markdown(f"#### {dow[k]}")
+                st.caption(day.strftime("%d/%m"))
+                if day_df.empty:
+                    st.caption("—")
+                    continue
+
+                total_day = float(day_df["volume_m3"].fillna(0).sum())
+                st.caption(f"{len(day_df)} agend. • {total_day:.1f} m³")
+
+                for _, r in day_df.iterrows():
+                    rid = int(r["id"])
+                    status = str(r["status"])
+                    icon = "✅" if status == "Concluido" else ("🟧" if status == "Execucao" else ("❌" if status == "Cancelado" else "🗓️"))
+                    warn = " ⚠️" if rid in conflicts_ids else ""
+                    title = f"{icon}{warn} {_hhmm(r['hora_inicio'])}–{_hhmm(r['hora_fim'])} • {r['obra']}"
+                    st.markdown(f"**{title}**")
+                    if compact:
+                        st.caption(f"{r.get('volume_m3','')} m³ • {r.get('bomba','')} • {r.get('equipe','')}")
+                    else:
+                        st.caption(f"Serviço: {r.get('servico','')}")
+                        st.caption(f"Volume: {r.get('volume_m3','')} m³")
+                        st.caption(f"Bomba/Equipe: {r.get('bomba','')} • {r.get('equipe','')}")
+                        st.caption(f"Responsável: {r.get('responsavel','')}")
+                        st.caption(f"Status: {status}")
+
 elif menu == "Novo agendamento":
     st.subheader("🧱 Novo agendamento de concretagem")
 
