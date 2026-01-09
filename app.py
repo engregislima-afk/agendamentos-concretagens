@@ -42,6 +42,22 @@ def only_digits(s: str) -> str:
     """Return only digits from string (safe for None)."""
     return re.sub(r"\D+", "", str(s or ""))
 
+def parse_number(s, default=None):
+    """Parse first number from text (accepts comma as decimal). Returns float or default."""
+    try:
+        if s is None:
+            return default
+        txt = str(s).strip()
+        if txt == "":
+            return default
+        m = re.search(r"[-+]?\d+(?:[\.,]\d+)?", txt)
+        if not m:
+            return default
+        num = m.group(0).replace(",", ".")
+        return float(num)
+    except Exception:
+        return default
+
 
 def calc_hora_fim(hora_inicio: str, duracao_min: Optional[int]) -> str:
     """Calcula hora fim (HH:MM) a partir da hora inicial e duração em minutos.
@@ -120,6 +136,7 @@ concretagens = Table(
     Column("volume_m3", Float, nullable=True),
     Column("fck_mpa", Float, nullable=True),
     Column("slump_mm", Float, nullable=True),
+    Column("slump_txt", Text, nullable=True),
 
     Column("usina", String(200), nullable=True),
     Column("bomba", String(200), nullable=True),
@@ -545,6 +562,23 @@ def migrate_schema(eng):
                 except Exception:
                     pass
 
+def migrate_schema(eng):
+    """Best-effort schema migrations (keeps app working on existing DBs)."""
+    try:
+        with eng.begin() as conn:
+            if eng.dialect.name == "sqlite":
+                # SQLite: no IF NOT EXISTS for ADD COLUMN in older versions
+                rows = conn.execute(text("PRAGMA table_info(concretagens)")).fetchall()
+                cols = {r[1] for r in rows}
+                if "slump_txt" not in cols:
+                    conn.execute(text("ALTER TABLE concretagens ADD COLUMN slump_txt TEXT"))
+            else:
+                # Postgres
+                conn.execute(text("ALTER TABLE concretagens ADD COLUMN IF NOT EXISTS slump_txt TEXT"))
+    except Exception:
+        # If migration fails, app still runs; worst case: we just won’t store slump_txt.
+        pass
+
 def init_db():
     eng = get_engine()
     # Testa conexão antes de tentar criar tabelas (evita crash "mudo" no Cloud)
@@ -582,6 +616,7 @@ Se preferir, use o **Pooler (Supavisor)** no Supabase → Connect (recomendado p
         st.stop()
 
     metadata.create_all(eng)
+    migrate_schema(eng)
     ensure_default_admin()
 
 def df_from_rows(rows, cols) -> pd.DataFrame:
@@ -1455,7 +1490,8 @@ elif menu == "Novo agendamento":
                     duracao_min=int(dur),
                     volume_m3=float(volume),
                     fck_mpa=float(fck) if fck else None,
-                    slump_mm=(slump or "").strip(),
+                    slump_mm=parse_number(slump, None),
+                    slump_txt=(slump.strip() if slump else None),
                     usina=(usina or "").strip(),
                     bomba=(bomba or "").strip(),
                     equipe=(equipe or "").strip(),
@@ -1585,7 +1621,8 @@ elif menu == "Agenda (lista)":
                         bomba=(new_bomba or "").strip(),
                         equipe=(new_equipe or "").strip(),
                         usina=(new_usina or "").strip(),
-                        slump_mm=(new_slump or "").strip(),
+                        slump_mm=parse_number(new_slump, None),
+                        slump_txt=(new_slump.strip() if new_slump else None),
                         volume_m3=float(new_volume),
                         fck_mpa=float(new_fck) if new_fck else None,
                         observacoes=(new_obs or "").strip(),
