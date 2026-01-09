@@ -38,6 +38,21 @@ import streamlit as st
 # =============================================================================
 # Helpers
 # =============================================================================
+
+
+def _local_tz():
+    """Timezone used by the app (default: America/Sao_Paulo)."""
+    tzname = os.environ.get("APP_TZ") or os.environ.get("TZ") or "America/Sao_Paulo"
+    try:
+        return ZoneInfo(tzname)
+    except Exception:
+        # Fallback to naive local time if ZoneInfo fails
+        return None
+
+def _local_now():
+    tz = _local_tz()
+    return datetime.now(tz) if tz else datetime.now()
+
 def only_digits(s: str) -> str:
     """Return only digits from string (safe for None)."""
     return re.sub(r"\D+", "", str(s or ""))
