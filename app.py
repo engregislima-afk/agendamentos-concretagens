@@ -1016,6 +1016,14 @@ def get_concretagens_df(range_start, range_end) -> pd.DataFrame:
         rows = con.execute(sql, {"ds": ds, "de": de}).mappings().all()
 
     df = pd.DataFrame(rows)
+
+    # Normalização de nomes de colunas (compatibilidade UI/Admin)
+    # Algumas consultas retornam alias em inglês (ex: created_at). Mantemos também o padrão pt-BR.
+    if "created_at" in df.columns and "criado_em" not in df.columns:
+        df["criado_em"] = df["created_at"]
+    if "updated_at" in df.columns and "atualizado_em" not in df.columns:
+        df["atualizado_em"] = df["updated_at"]
+
     if df.empty:
         # garante colunas para não quebrar telas (ex.: dashboard) quando não há registros
         return pd.DataFrame(columns=[
