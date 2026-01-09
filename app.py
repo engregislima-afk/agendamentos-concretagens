@@ -736,6 +736,16 @@ def get_concretagens_df(range_start: date, range_end: date) -> pd.DataFrame:
     de = range_end.strftime("%Y-%m-%d")
 
     eng = get_engine()
+    # Aceita date/datetime/str (YYYY-MM-DD) para facilitar chamadas do app
+    if isinstance(range_start, str):
+        range_start = date.fromisoformat(str(range_start)[:10])
+    elif isinstance(range_start, datetime):
+        range_start = range_start.date()
+    if isinstance(range_end, str):
+        range_end = date.fromisoformat(str(range_end)[:10])
+    elif isinstance(range_end, datetime):
+        range_end = range_end.date()
+
     sql = text("""
         SELECT c.id, c.data, c.hora_inicio, c.duracao_min, c.volume_m3, c.fck_mpa, c.slump_mm,
                c.usina, c.bomba, c.equipe, c.status,
