@@ -1194,7 +1194,7 @@ def export_excel(df: pd.DataFrame) -> bytes:
 # ============================
 # App start
 # ============================
-st.set_page_config(page_title="Agendamentos de Concretagens", layout="wide")
+st.set_page_config(page_title="Agendamentos de Concretagens e Atendimentos ", layout="wide")
 st.markdown(WIN11_CSS, unsafe_allow_html=True)
 
 init_db()
