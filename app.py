@@ -43,6 +43,23 @@ def only_digits(s: str) -> str:
     return re.sub(r"\D+", "", str(s or ""))
 
 
+def calc_hora_fim(hora_inicio: str, duracao_min: Optional[int]) -> str:
+    """Calcula hora fim (HH:MM) a partir da hora inicial e duração em minutos.
+    Retorna string vazia se a entrada for inválida.
+    """
+    try:
+        if not hora_inicio:
+            return ""
+        parts = str(hora_inicio).strip().split(":")
+        h = int(parts[0])
+        m = int(parts[1]) if len(parts) > 1 else 0
+        mins = int(duracao_min or 0)
+        total = (h * 60 + m + mins) % (24 * 60)
+        return f"{total // 60:02d}:{total % 60:02d}"
+    except Exception:
+        return ""
+
+
 from sqlalchemy import (
     create_engine, MetaData, Table, Column,
     Integer, String, Float, Text, ForeignKey, Boolean,
@@ -824,67 +841,53 @@ def get_obras_df() -> pd.DataFrame:
         obras.c.criado_em
     ).order_by(obras.c.id.desc()))
 
-def get_concretagens_df(range_start: date, range_end: date) -> pd.DataFrame:
-    """Retorna concretagens no intervalo [range_start, range_end] (inclusive).
+def get_concretagens_df(range_start, range_end) -> pd.DataFrame:
+    range_start = ensure_date(range_start)
+    range_end = ensure_date(range_end)
+    ds = range_start.isoformat()
+    de = range_end.isoformat()
 
-    Aceita date/datetime/string (YYYY-MM-DD ou DD/MM/YYYY).
-    """
     eng = get_engine()
-
-    def _to_date(x):
-        if x is None:
-            return date.today()
-        if isinstance(x, datetime):
-            return x.date()
-        if isinstance(x, date):
-            return x
-        s = str(x).strip()
-        if not s:
-            return date.today()
-        # ISO (YYYY-MM-DD) ou ISO com hora
-        try:
-            return date.fromisoformat(s[:10])
-        except Exception:
-            pass
-        # BR (DD/MM/YYYY)
-        m = re.match(r"^(\d{2})/(\d{2})/(\d{4})", s)
-        if m:
-            dd, mm, yyyy = int(m.group(1)), int(m.group(2)), int(m.group(3))
-            return date(yyyy, mm, dd)
-        return date.today()
-
-    ds_d = _to_date(range_start)
-    de_d = _to_date(range_end)
-    ds = ds_d.isoformat()
-    de = de_d.isoformat()
-
-    # Nota: este app guarda a data como texto ISO (YYYY-MM-DD) para manter compatibilidade SQLite/Postgres.
-    # Se houver obra cadastrada, usa o cadastro (obras.*); senão, usa o snapshot salvo em concretagens (c.obra/c.cliente/c.cidade).
     sql = text("""
         SELECT
             c.id,
-            COALESCE(o.nome, c.obra)   AS obra,
-            COALESCE(o.cliente, c.cliente) AS cliente,
-            COALESCE(o.cidade, c.cidade)   AS cidade,
+            c.obra_id,
+            o.nome        AS obra,
+            o.cliente     AS cliente,
+            o.cidade      AS cidade,
+            o.responsavel AS responsavel,
+            o.telefone    AS telefone,
             c.data,
             c.hora_inicio,
-            c.hora_fim,
-            c.volume,
-            c.fornecedor,
-            c.fck,
-            c.slump,
-            c.tipo_servico,
-            c.observacoes
+            c.duracao_min,
+            c.volume_m3,
+            c.usina,
+            c.fck_mpa,
+            c.slump_mm,
+            c.bomba,
+            c.equipe,
+            c.status,
+            c.observacoes,
+            c.created_at
         FROM concretagens c
         LEFT JOIN obras o ON o.id = c.obra_id
         WHERE c.data >= :ds AND c.data <= :de
         ORDER BY c.data, c.hora_inicio, c.id
     """)
-
     with eng.connect() as con:
         rows = con.execute(sql, {"ds": ds, "de": de}).mappings().all()
 
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    for col in ("duracao_min", "volume_m3", "fck_mpa", "slump_mm"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df["hora_fim"] = df.apply(lambda r: calc_hora_fim(r.get("hora_inicio"), r.get("duracao_min")), axis=1)
+    return df
+
 def get_concretagem_by_id(cid: int) -> Dict[str, Any]:
     row = fetch_one(select(concretagens).where(concretagens.c.id == int(cid)))
     return row or {}
@@ -905,72 +908,56 @@ def get_history_df(concretagem_id: int) -> pd.DataFrame:
         historico.c.antes_json, historico.c.depois_json
     ).where(historico.c.concretagem_id == int(concretagem_id)).order_by(historico.c.id.desc()))
 
-def find_conflicts(
-    new_data: str,
-    new_hora: str,
-    new_dur: int,
-    bomba: str,
-    equipe: str,
-    ignore_id: Optional[int] = None,
-) -> List[Dict[str, Any]]:
-    """Procura conflitos de agenda (sobreposição de horários) para o MESMO recurso (bomba/equipe).
+def find_conflicts(date_iso: str, hora_inicio: str, duracao_min: int, ignore_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Detecta conflitos (sobreposição de horários) na mesma data."""
+    d = ensure_date(date_iso)
+    ds = d.isoformat()
 
-    Observação: considera como 'ativos' os status que ainda podem conflitar:
-    Agendado, Aguardando, Confirmado e Execucao.
-    """
-    inicio = to_time(new_hora)
-    fim = (datetime.combine(date(2000, 1, 1), inicio) + timedelta(minutes=int(new_dur))).time()
+    def _parse_time(hhmm: str) -> time:
+        try:
+            hhmm = (hhmm or "").strip()
+            if not hhmm:
+                return time(0, 0)
+            return datetime.strptime(hhmm, "%H:%M").time()
+        except Exception:
+            return time(0, 0)
 
-    active_status = ("Agendado", "Aguardando", "Confirmado", "Execucao")
+    start_dt = datetime.combine(d, _parse_time(hora_inicio))
+    end_dt = start_dt + timedelta(minutes=int(duracao_min or 0))
 
-    conds = [
-        concretagens.c.data == new_data,
-        concretagens.c.status.in_(active_status),
-        concretagens.c.hora_inicio < fim,
-        concretagens.c.hora_fim > inicio,
-    ]
-    if ignore_id is not None:
-        conds.append(concretagens.c.id != int(ignore_id))
-
-    # Restringe por recurso quando informado (bomba/equipe)
-    resource_conds = []
-    if bomba and str(bomba).strip():
-        resource_conds.append(concretagens.c.bomba == bomba)
-    if equipe and str(equipe).strip():
-        resource_conds.append(concretagens.c.equipe == equipe)
-    if resource_conds:
-        conds.append(or_(*resource_conds))
-
-    stmt = (
-        select(
-            concretagens.c.id,
-            obras.c.nome.label("obra"),
-            concretagens.c.hora_inicio,
-            concretagens.c.hora_fim,
-            concretagens.c.status,
-            concretagens.c.bomba,
-            concretagens.c.equipe,
+    eng = get_engine()
+    with eng.connect() as con:
+        stmt = (
+            select(
+                concretagens.c.id,
+                concretagens.c.obra_id,
+                concretagens.c.data,
+                concretagens.c.hora_inicio,
+                concretagens.c.duracao_min,
+                concretagens.c.status,
+                obras.c.nome.label("obra"),
+                obras.c.cliente.label("cliente"),
+                obras.c.cidade.label("cidade"),
+            )
+            .select_from(concretagens.join(obras, obras.c.id == concretagens.c.obra_id, isouter=True))
+            .where(concretagens.c.data == ds)
         )
-        .select_from(concretagens.join(obras, concretagens.c.obra_id == obras.c.id))
-        .where(and_(*conds))
-        .order_by(concretagens.c.hora_inicio.asc())
-    )
+        if ignore_id is not None:
+            stmt = stmt.where(concretagens.c.id != int(ignore_id))
 
-    with get_engine().connect() as conn:
-        rows = conn.execute(stmt).mappings().all()
+        rows = con.execute(stmt).mappings().all()
 
-    out: List[Dict[str, Any]] = []
+    conflicts: List[Dict[str, Any]] = []
     for r in rows:
-        out.append({
-            "id": r["id"],
-            "obra": r["obra"],
-            "hora_inicio": r["hora_inicio"],
-            "hora_fim": r["hora_fim"],
-            "status": r["status"],
-            "bomba": r["bomba"],
-            "equipe": r["equipe"],
-        })
-    return out
+        sdt = datetime.combine(d, _parse_time(r.get("hora_inicio") or ""))
+        edt = sdt + timedelta(minutes=int(r.get("duracao_min") or 0))
+        if max(sdt, start_dt) < min(edt, end_dt):
+            rr = dict(r)
+            rr["hora_fim"] = calc_hora_fim(rr.get("hora_inicio"), rr.get("duracao_min"))
+            conflicts.append(rr)
+
+    return conflicts
+
 def export_excel(df: pd.DataFrame) -> bytes:
     import io
     output = io.BytesIO()
