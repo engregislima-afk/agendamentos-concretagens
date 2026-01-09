@@ -38,6 +38,86 @@ from sqlalchemy import (
     Integer, String, Float, Text, ForeignKey, Boolean,
     select, insert, update, text, and_, or_
 )
+
+# =============================================================================
+# SCHEMA (SQLAlchemy Core)
+# =============================================================================
+# Obs: Mantemos tipos simples (String/Float/Integer/Boolean) para compatibilidade
+# entre SQLite (local) e Postgres/Supabase (nuvem).
+metadata = MetaData()
+
+users = Table(
+    "users", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("username", String(80), unique=True, nullable=False),
+    Column("name", String(120), nullable=True),
+    Column("role", String(40), nullable=True),
+    Column("pass_salt", String(64), nullable=False),
+    Column("pass_hash", String(128), nullable=False),
+    Column("is_active", Boolean, nullable=False, server_default=text("true")),
+    Column("created_at", String(40), nullable=True),
+    Column("last_login_at", String(40), nullable=True),
+)
+
+obras = Table(
+    "obras", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("nome", String(200), nullable=False),
+    Column("cliente", String(200), nullable=True),
+    Column("cidade", String(120), nullable=True),
+    Column("endereco", String(240), nullable=True),
+    Column("responsavel", String(120), nullable=True),
+    Column("telefone", String(50), nullable=True),
+    Column("cnpj", String(40), nullable=True),
+    Column("razao_social", String(220), nullable=True),
+    Column("nome_fantasia", String(220), nullable=True),
+    Column("criado_em", String(40), nullable=True),
+    Column("atualizado_em", String(40), nullable=True),
+    Column("criado_por", String(120), nullable=True),
+    Column("alterado_por", String(120), nullable=True),
+)
+
+concretagens = Table(
+    "concretagens", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("obra_id", Integer, ForeignKey("obras.id", ondelete="SET NULL"), nullable=True),
+
+    Column("obra", String(200), nullable=True),
+    Column("cliente", String(200), nullable=True),
+    Column("cidade", String(120), nullable=True),
+
+    Column("data", String(20), nullable=False),           # YYYY-MM-DD
+    Column("hora_inicio", String(10), nullable=True),     # HH:MM
+    Column("duracao_min", Integer, nullable=True),
+
+    Column("volume_m3", Float, nullable=True),
+    Column("fck_mpa", Float, nullable=True),
+    Column("slump_mm", Float, nullable=True),
+
+    Column("usina", String(200), nullable=True),
+    Column("bomba", String(200), nullable=True),
+    Column("equipe", String(200), nullable=True),
+
+    Column("status", String(40), nullable=True),
+
+    Column("observacoes", Text, nullable=True),
+
+    Column("criado_em", String(40), nullable=True),
+    Column("criado_por", String(120), nullable=True),
+    Column("atualizado_em", String(40), nullable=True),
+    Column("alterado_por", String(120), nullable=True),
+)
+
+historico = Table(
+    "historico", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("acao", String(80), nullable=False),
+    Column("entidade", String(80), nullable=False),
+    Column("entidade_id", Integer, nullable=True),
+    Column("detalhes", Text, nullable=True),
+    Column("usuario", String(120), nullable=True),
+    Column("criado_em", String(40), nullable=True),
+)
 from sqlalchemy.engine import Engine
 
 TZ_LABEL = "America/Sao_Paulo"
@@ -228,6 +308,12 @@ def get_engine() -> Engine:
 
     if not db_url:
         db_url = os.environ.get("DB_URL") or os.environ.get("DATABASE_URL")
+    # For Supabase/Postgres on cloud, SSL is usually required.
+    if db_url and db_url.startswith('postgres') and 'sslmode=' not in db_url:
+        sep = '&' if '?' in db_url else '?'
+        db_url = db_url + f"{sep}sslmode=require"
+
+    # Supabase pooler strings sometimes omit the '+psycopg2' driver; SQLAlchemy handles it.
 
     # 2) Se tiver URL explícita, usa-a
     if db_url:
