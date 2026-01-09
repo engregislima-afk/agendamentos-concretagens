@@ -398,6 +398,99 @@ def get_engine() -> Engine:
 
     # 3) Padrão local (SQLite)
     return create_engine("sqlite:///agendamentos.db", future=True, connect_args={"check_same_thread": False})
+def migrate_schema(eng):
+    """Aplica migrações simples (ADD COLUMN) quando o banco já existe com schema antigo.
+    Não remove nem altera colunas existentes.
+    """
+    try:
+        from sqlalchemy import inspect
+    except Exception:
+        return
+
+    dialect = getattr(eng.dialect, "name", "")
+    insp = inspect(eng)
+
+    def existing_cols(table_name: str) -> set:
+        try:
+            return {c["name"] for c in insp.get_columns(table_name)}
+        except Exception:
+            return set()
+
+    # Tipos por dialeto (suficiente para Postgres e SQLite)
+    def t_varchar(n=255):
+        return f"VARCHAR({n})" if dialect != "sqlite" else "TEXT"
+
+    def t_text():
+        return "TEXT"
+
+    def t_float():
+        return "DOUBLE PRECISION" if dialect != "sqlite" else "REAL"
+
+    def t_int():
+        return "INTEGER"
+
+    def t_ts():
+        return "TIMESTAMP" if dialect != "sqlite" else "TEXT"
+
+    desired = {
+        "obras": {
+            "nome": t_varchar(255),
+            "cliente": t_varchar(255),
+            "cnpj": t_varchar(40),
+            "endereco": t_varchar(255),
+            "cidade": t_varchar(120),
+            "uf": t_varchar(8),
+            "responsavel": t_varchar(120),
+            "telefone": t_varchar(40),
+            "email": t_varchar(120),
+            "observacoes": t_text(),
+            "criado_em": t_ts(),
+            "atualizado_em": t_ts(),
+            "criado_por": t_varchar(80),
+            "alterado_por": t_varchar(80),
+        },
+        "concretagens": {
+            "obra_id": t_int(),
+            "obra": t_varchar(255),
+            "cliente": t_varchar(255),
+            "cidade": t_varchar(120),
+            "data": t_varchar(20),
+            "hora_inicio": t_varchar(10),
+            "hora_fim": t_varchar(10),
+            "volume": t_float(),
+            "fornecedor": t_varchar(255),
+            "fck": t_float(),
+            "slump": t_float(),
+            "tipo_servico": t_varchar(120),
+            "observacoes": t_text(),
+            "criado_em": t_ts(),
+            "atualizado_em": t_ts(),
+            "criado_por": t_varchar(80),
+            "alterado_por": t_varchar(80),
+        },
+        "users": {
+            "username": t_varchar(80),
+            "pass_hash": t_varchar(255),
+            "role": t_varchar(30),
+            "is_active": "BOOLEAN" if dialect != "sqlite" else "INTEGER",
+            "created_at": t_ts(),
+        },
+    }
+
+    with eng.begin() as con:
+        for tbl, cols in desired.items():
+            have = existing_cols(tbl)
+            if not have:
+                continue
+            for col, sqltype in cols.items():
+                if col in have:
+                    continue
+                stmt = f'ALTER TABLE "{tbl}" ADD COLUMN "{col}" {sqltype}'
+                try:
+                    con.execute(text(stmt))
+                except Exception:
+                    pass
+
 def init_db():
     eng = get_engine()
     # Testa conexão antes de tentar criar tabelas (evita crash "mudo" no Cloud)
@@ -732,48 +825,66 @@ def get_obras_df() -> pd.DataFrame:
     ).order_by(obras.c.id.desc()))
 
 def get_concretagens_df(range_start: date, range_end: date) -> pd.DataFrame:
+    """Retorna concretagens no intervalo [range_start, range_end] (inclusive).
+
+    Aceita date/datetime/string (YYYY-MM-DD ou DD/MM/YYYY).
+    """
     eng = get_engine()
 
-    # Aceita date/datetime/str (YYYY-MM-DD) para facilitar chamadas do app
     def _to_date(x):
-        if isinstance(x, date) and not isinstance(x, datetime):
-            return x
+        if x is None:
+            return date.today()
         if isinstance(x, datetime):
             return x.date()
-        if isinstance(x, str):
-            # suporta 'YYYY-MM-DD' e 'YYYY-MM-DDTHH:MM:SS'
-            return date.fromisoformat(str(x)[:10])
-        # fallback: tenta converter via str()
-        return date.fromisoformat(str(x)[:10])
+        if isinstance(x, date):
+            return x
+        s = str(x).strip()
+        if not s:
+            return date.today()
+        # ISO (YYYY-MM-DD) ou ISO com hora
+        try:
+            return date.fromisoformat(s[:10])
+        except Exception:
+            pass
+        # BR (DD/MM/YYYY)
+        m = re.match(r"^(\d{2})/(\d{2})/(\d{4})", s)
+        if m:
+            dd, mm, yyyy = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            return date(yyyy, mm, dd)
+        return date.today()
 
-    range_start = _to_date(range_start)
-    range_end = _to_date(range_end)
+    ds_d = _to_date(range_start)
+    de_d = _to_date(range_end)
+    ds = ds_d.isoformat()
+    de = de_d.isoformat()
 
-    ds = range_start.strftime("%Y-%m-%d")
-    de = range_end.strftime("%Y-%m-%d")
-
+    # Nota: este app guarda a data como texto ISO (YYYY-MM-DD) para manter compatibilidade SQLite/Postgres.
+    # Se houver obra cadastrada, usa o cadastro (obras.*); senão, usa o snapshot salvo em concretagens (c.obra/c.cliente/c.cidade).
     sql = text("""
-        SELECT c.id, c.data, c.hora_inicio, c.duracao_min, c.volume_m3, c.fck_mpa, c.slump_mm,
-               c.usina, c.bomba, c.equipe, c.status,
-               o.nome as obra_nome, o.endereco as obra_endereco,
-               cl.nome as cliente_nome
+        SELECT
+            c.id,
+            COALESCE(o.nome, c.obra)   AS obra,
+            COALESCE(o.cliente, c.cliente) AS cliente,
+            COALESCE(o.cidade, c.cidade)   AS cidade,
+            c.data,
+            c.hora_inicio,
+            c.hora_fim,
+            c.volume,
+            c.fornecedor,
+            c.fck,
+            c.slump,
+            c.tipo_servico,
+            c.observacoes
         FROM concretagens c
-        JOIN obras o ON o.id = c.obra_id
-        LEFT JOIN clientes cl ON cl.id = o.cliente_id
+        LEFT JOIN obras o ON o.id = c.obra_id
         WHERE c.data >= :ds AND c.data <= :de
-        ORDER BY c.data, c.hora_inicio
+        ORDER BY c.data, c.hora_inicio, c.id
     """)
+
     with eng.connect() as con:
         rows = con.execute(sql, {"ds": ds, "de": de}).mappings().all()
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-    # Garantir tipos
-    df["data"] = pd.to_datetime(df["data"]).dt.date
-    # hora_inicio pode vir como time, string ou None
-    df["hora_inicio"] = df["hora_inicio"].astype(str).replace({"None": ""})
-    return df
 
+    return pd.DataFrame(rows)
 def get_concretagem_by_id(cid: int) -> Dict[str, Any]:
     row = fetch_one(select(concretagens).where(concretagens.c.id == int(cid)))
     return row or {}
