@@ -33,6 +33,15 @@ import pandas as pd
 import requests
 import streamlit as st
 
+
+# =============================================================================
+# Helpers
+# =============================================================================
+def only_digits(s: str) -> str:
+    """Return only digits from string (safe for None)."""
+    return re.sub(r"\D+", "", str(s or ""))
+
+
 from sqlalchemy import (
     create_engine, MetaData, Table, Column,
     Integer, String, Float, Text, ForeignKey, Boolean,
@@ -556,99 +565,147 @@ def require_login():
 
 @st.cache_data(ttl=24*3600, show_spinner=False)
 def fetch_cnpj_data(cnpj: str):
-    """Busca dados de CNPJ para auto-preencher campos do formulário.
+    """Busca dados públicos de CNPJ com fallback.
 
-    Prioridade:
-      1) BrasilAPI (gratuito e estável)
-      2) cnpj.ws (legado)
-      3) ReceitaWS (pode ter rate-limit/bloqueios)
+    Retorna: (ok: bool, msg: str, payload: dict|None)
+    payload contém chaves:
+      - cnpj, razao_social, nome_fantasia, endereco, cidade, uf, cep, cliente_sugerido
     """
-    if not requests:
-        return None, "Biblioteca 'requests' não disponível."
-
     cnpj_digits = only_digits(cnpj or "")
     if len(cnpj_digits) != 14:
-        return None, "CNPJ inválido (precisa ter 14 dígitos)."
+        return False, "CNPJ inválido (precisa ter 14 dígitos).", None
 
-    # 1) BrasilAPI
-    try:
-        url = f"https://brasilapi.com.br/api/cnpj/v1/{cnpj_digits}"
-        r = requests.get(url, timeout=10, headers={"User-Agent": "Habisolute/1.0"})
-        if r.status_code == 200:
-            j = r.json() or {}
-            data = {
-                "nome": (j.get("razao_social") or j.get("nome") or "").strip(),
-                "fantasia": (j.get("nome_fantasia") or j.get("fantasia") or "").strip(),
-                "logradouro": (j.get("logradouro") or j.get("descricao_tipo_de_logradouro") or "").strip(),
-                "numero": (j.get("numero") or "").strip(),
-                "bairro": (j.get("bairro") or "").strip(),
-                "municipio": (j.get("municipio") or j.get("cidade") or "").strip(),
-                "uf": (j.get("uf") or "").strip(),
-                "cep": (only_digits(j.get("cep") or "") or "").strip(),
-            }
-            return data, None
-        if r.status_code not in (404, 429):
-            return None, f"Falha na consulta BrasilAPI (status {r.status_code})."
-        # 404/429: segue para fallback
-    except Exception as e:
-        # segue para fallback
-        pass
+    if requests is None:
+        return False, "Biblioteca 'requests' não está disponível no ambiente.", None
 
-    # 2) cnpj.ws (legado — alguns ambientes retornam 404)
-    try:
-        url = f"https://publica.cnpj.ws/cnpj/{cnpj_digits}"
-        r = requests.get(url, timeout=10, headers={"User-Agent": "Habisolute/1.0"})
-        if r.status_code == 200:
-            j = r.json() or {}
-            est = (j.get("estabelecimento") or {})
-            cidade = (est.get("cidade") or {})
-            estado = (cidade.get("estado") or {})
-            data = {
-                "nome": (j.get("razao_social") or "").strip(),
-                "fantasia": (est.get("nome_fantasia") or "").strip(),
-                "logradouro": (est.get("tipo_logradouro") or "").strip() + " " + (est.get("logradouro") or "").strip(),
-                "numero": (est.get("numero") or "").strip(),
-                "bairro": (est.get("bairro") or "").strip(),
-                "municipio": (cidade.get("nome") or "").strip(),
-                "uf": (estado.get("sigla") or "").strip(),
-                "cep": (only_digits(est.get("cep") or "") or "").strip(),
-            }
-            # normalizar espaços duplos
-            data["logradouro"] = " ".join(data["logradouro"].split())
-            return data, None
-        if r.status_code not in (404, 429):
-            return None, f"Falha na consulta cnpj.ws (status {r.status_code})."
-    except Exception:
-        pass
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Streamlit; +https://streamlit.io)",
+        "Accept": "application/json, text/plain, */*",
+    }
 
-    # 3) ReceitaWS (último recurso)
-    try:
-        url = f"https://www.receitaws.com.br/v1/cnpj/{cnpj_digits}"
-        r = requests.get(url, timeout=15, headers={"User-Agent": "Habisolute/1.0"})
-        if r.status_code == 200:
-            j = r.json() or {}
-            if str(j.get("status", "")).lower() == "error":
-                msg = j.get("message") or "Erro na ReceitaWS."
-                return None, msg
-            data = {
-                "nome": (j.get("nome") or "").strip(),
-                "fantasia": (j.get("fantasia") or "").strip(),
-                "logradouro": (j.get("logradouro") or "").strip(),
-                "numero": (j.get("numero") or "").strip(),
-                "bairro": (j.get("bairro") or "").strip(),
-                "municipio": (j.get("municipio") or "").strip(),
-                "uf": (j.get("uf") or "").strip(),
-                "cep": (only_digits(j.get("cep") or "") or "").strip(),
-            }
-            return data, None
-        return None, f"Não foi possível consultar CNPJ (status {r.status_code})."
-    except Exception as e:
-        return None, f"Não foi possível consultar CNPJ ({type(e).__name__})."
+    def _mk_payload(parsed: dict) -> dict:
+        # garante todas as chaves esperadas
+        return {
+            "cnpj": parsed.get("cnpj") or cnpj_digits,
+            "razao_social": parsed.get("razao_social") or "",
+            "nome_fantasia": parsed.get("nome_fantasia") or "",
+            "endereco": parsed.get("endereco") or "",
+            "cidade": parsed.get("cidade") or "",
+            "uf": parsed.get("uf") or "",
+            "cep": only_digits(parsed.get("cep") or "")[:8],
+            "cliente_sugerido": parsed.get("cliente_sugerido") or "",
+        }
 
+    def _parse_brasilapi(j: dict) -> dict:
+        # BrasilAPI (cnpj/v1)
+        legal_name = (j.get("razao_social") or "").strip()
+        trade_name = (j.get("nome_fantasia") or "").strip()
+        logradouro = (j.get("logradouro") or "").strip()
+        numero = (j.get("numero") or "").strip()
+        complemento = (j.get("complemento") or "").strip()
+        bairro = (j.get("bairro") or "").strip()
+        municipio = (j.get("municipio") or "").strip()
+        uf = (j.get("uf") or "").strip()
+        cep = (j.get("cep") or "").strip()
+        parts = [p for p in [logradouro, numero, complemento, bairro] if p]
+        endereco = ", ".join(parts)
+        cliente = trade_name or legal_name
+        return {
+            "cnpj": cnpj_digits,
+            "razao_social": legal_name,
+            "nome_fantasia": trade_name,
+            "endereco": endereco,
+            "cidade": municipio,
+            "uf": uf,
+            "cep": cep,
+            "cliente_sugerido": cliente,
+        }
 
-# ============================
-# Concretagem helpers
-# ============================
+    def _parse_cnpjws(j: dict) -> dict:
+        # publica.cnpj.ws
+        # Estrutura pode variar; usamos campos defensivos
+        estab = j.get("estabelecimento") or {}
+        legal_name = (j.get("razao_social") or j.get("nome") or "").strip()
+        trade_name = (estab.get("nome_fantasia") or j.get("nome_fantasia") or "").strip()
+        logradouro = (estab.get("logradouro") or "").strip()
+        numero = (estab.get("numero") or "").strip()
+        complemento = (estab.get("complemento") or "").strip()
+        bairro = (estab.get("bairro") or "").strip()
+        municipio = (estab.get("cidade", {}).get("nome") if isinstance(estab.get("cidade"), dict) else estab.get("cidade")) or ""
+        municipio = str(municipio).strip()
+        uf = (estab.get("estado", {}).get("sigla") if isinstance(estab.get("estado"), dict) else estab.get("estado")) or ""
+        uf = str(uf).strip()
+        cep = (estab.get("cep") or "").strip()
+        parts = [p for p in [logradouro, numero, complemento, bairro] if p]
+        endereco = ", ".join(parts)
+        cliente = trade_name or legal_name
+        return {
+            "cnpj": cnpj_digits,
+            "razao_social": legal_name,
+            "nome_fantasia": trade_name,
+            "endereco": endereco,
+            "cidade": municipio,
+            "uf": uf,
+            "cep": cep,
+            "cliente_sugerido": cliente,
+        }
+
+    def _parse_receitaws(j: dict) -> dict:
+        # receitaws.com.br
+        legal_name = (j.get("nome") or j.get("razao_social") or "").strip()
+        trade_name = (j.get("fantasia") or j.get("nome_fantasia") or "").strip()
+        logradouro = (j.get("logradouro") or "").strip()
+        numero = (j.get("numero") or "").strip()
+        complemento = (j.get("complemento") or "").strip()
+        bairro = (j.get("bairro") or "").strip()
+        municipio = (j.get("municipio") or "").strip()
+        uf = (j.get("uf") or "").strip()
+        cep = (j.get("cep") or "").strip()
+        parts = [p for p in [logradouro, numero, complemento, bairro] if p]
+        endereco = ", ".join(parts)
+        cliente = trade_name or legal_name
+        return {
+            "cnpj": cnpj_digits,
+            "razao_social": legal_name,
+            "nome_fantasia": trade_name,
+            "endereco": endereco,
+            "cidade": municipio,
+            "uf": uf,
+            "cep": cep,
+            "cliente_sugerido": cliente,
+        }
+
+    providers = [
+        ("BrasilAPI", f"https://brasilapi.com.br/api/cnpj/v1/{cnpj_digits}", _parse_brasilapi),
+        ("CNPJ.ws", f"https://publica.cnpj.ws/cnpj/{cnpj_digits}", _parse_cnpjws),
+        ("ReceitaWS", f"https://www.receitaws.com.br/v1/cnpj/{cnpj_digits}", _parse_receitaws),
+    ]
+
+    last_err = None
+    for name, url, parser in providers:
+        try:
+            r = requests.get(url, headers=headers, timeout=12)
+            # alguns provedores respondem com html/text em erros
+            ct = (r.headers.get("content-type") or "").lower()
+            if r.status_code == 200 and ("json" in ct or r.text.strip().startswith("{")):
+                j = r.json()
+                # ReceitaWS retorna {"status":"ERROR", "message":...}
+                if isinstance(j, dict) and str(j.get("status", "")).upper() == "ERROR":
+                    last_err = f"{name}: {j.get('message') or 'erro'}"
+                    continue
+                parsed = parser(j if isinstance(j, dict) else {})
+                return True, "OK", _mk_payload(parsed)
+
+            # 404 = não achou nesse provedor (tenta o próximo)
+            if r.status_code in (404, 429, 500, 502, 503, 504):
+                last_err = f"{name}: HTTP {r.status_code}"
+                continue
+
+            last_err = f"{name}: HTTP {r.status_code}"
+        except Exception as e:
+            last_err = f"{name}: {type(e).__name__}: {e}"
+
+    return False, f"Não foi possível consultar o CNPJ. ({last_err or 'sem detalhes'})", None
 
 def calc_trucks(volume_m3: float, capacidade_m3: float = 8.0) -> int:
     if volume_m3 <= 0:
