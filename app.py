@@ -111,8 +111,7 @@ def calc_hora_fim(hora_inicio: str, duracao_min: Optional[int]) -> str:
 from sqlalchemy import (
     create_engine, MetaData, Table, Column,
     Integer, String, Float, Text, ForeignKey, Boolean,
-    select, insert, update, text, and_, or_,
-    delete,
+    select, insert, update, text, and_, or_
 )
 
 # =============================================================================
@@ -202,132 +201,113 @@ TZ_LABEL = "America/Sao_Paulo"
 # ============================
 # Windows 11-ish styling
 # ============================
-WIN11_CSS = """/* ============================
-   Habisolute — Tema (Laranja + Dark Sidebar)
-   ============================ */
+WIN11_CSS = """<style>
 :root{
-  --hab-orange:#ff5a00;
-  --hab-orange-2:#f97316;
-  --hab-dark:#0b1220;
-  --hab-slate:#0f172a;
-  --hab-bg:#f8fafc;
-  --hab-card:#ffffff;
-  --hab-border:rgba(15, 23, 42, .10);
-  --hab-text:#0f172a;
-  --hab-muted:#64748b;
+  --hab-orange:#f97316;
+  --hab-orange-dark:#ea580c;
+  --bg:#f6f7fb;
+  --card:#ffffff;
+  --text:#0f172a;
+  --muted:#64748b;
+  --border:#e2e8f0;
+  --shadow:0 10px 30px rgba(2,6,23,.08);
+  --radius:16px;
 }
 
-/* Fundo geral */
-.stApp{
-  background: linear-gradient(180deg, #fff7ed 0%, #ffffff 40%, #f8fafc 100%) !important;
+/* App background */
+html, body, [data-testid="stAppViewContainer"]{
+  background: var(--bg) !important;
+  color: var(--text) !important;
 }
 
-/* Centralização / largura */
-.block-container{
-  padding-top: 1.2rem !important;
-  padding-bottom: 2.2rem !important;
-  max-width: 1200px !important;
+/* Header */
+[data-testid="stHeader"]{ background: transparent !important; }
+[data-testid="stToolbar"]{ right: 1rem; }
+
+/* Sidebar */
+[data-testid="stSidebar"] > div{
+  background: linear-gradient(180deg,#ffffff 0%,#fbfbfe 100%) !important;
+  border-right: 1px solid var(--border);
 }
 
-/* Cards “macios” */
-div[data-testid="stVerticalBlock"] > div:has(> div[data-testid="stMetric"]) {
-  background: var(--hab-card);
-  border: 1px solid var(--hab-border);
-  border-radius: 16px;
-  padding: 14px 14px 6px 14px;
-  box-shadow: 0 6px 22px rgba(2, 6, 23, .06);
+/* Main padding */
+section.main > div{ padding-top: 1.1rem; padding-bottom: 2.6rem; }
+
+/* Typography */
+h1,h2,h3{ letter-spacing: -0.02em; }
+label, .stMarkdown, p, span{ color: var(--text) !important; }
+small{ color: var(--muted) !important; }
+
+/* Metrics */
+[data-testid="stMetricValue"]{ font-size: 30px; font-weight: 750; }
+[data-testid="stMetricLabel"]{ color: var(--muted) !important; }
+
+/* Buttons */
+button{ border-radius: 14px !important; }
+button[kind="primary"]{
+  background: var(--hab-orange) !important;
+  border: 1px solid var(--hab-orange) !important;
+  color: #fff !important;
+}
+button[kind="primary"]:hover{
+  background: var(--hab-orange-dark) !important;
+  border-color: var(--hab-orange-dark) !important;
+}
+button[kind="secondary"]{
+  background: #fff !important;
+  border: 1px solid var(--border) !important;
+}
+button[kind="secondary"]:hover{
+  border-color: var(--hab-orange) !important;
+  color: var(--hab-orange-dark) !important;
 }
 
-/* Sidebar dark */
-section[data-testid="stSidebar"] > div{
-  background: linear-gradient(180deg, var(--hab-dark) 0%, var(--hab-slate) 100%) !important;
-  border-right: 1px solid rgba(255,255,255,.08);
-}
-section[data-testid="stSidebar"] *{
-  color: rgba(255,255,255,.90) !important;
-}
-section[data-testid="stSidebar"] a{
-  color: rgba(255,255,255,.90) !important;
+/* Tables */
+[data-testid="stDataFrame"], [data-testid="stTable"]{
+  border-radius: var(--radius);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
 }
 
-/* Radio do menu */
-section[data-testid="stSidebar"] .stRadio div[role="radiogroup"] label{
-  background: rgba(255,255,255,.06);
-  border: 1px solid rgba(255,255,255,.10);
-  border-radius: 14px;
-  padding: .55rem .75rem;
-  margin-bottom: .35rem;
-}
-section[data-testid="stSidebar"] .stRadio div[role="radiogroup"] label:hover{
-  border-color: rgba(255,90,0,.85);
-  box-shadow: 0 0 0 3px rgba(255,90,0,.18);
-}
-section[data-testid="stSidebar"] .stRadio div[role="radiogroup"] label:has(input:checked){
-  background: rgba(255,90,0,.20);
-  border-color: rgba(255,90,0,.95);
-}
-
-/* Inputs – mais visíveis */
+/* Inputs — deixar visíveis (claro/escuro) */
 div[data-baseweb="input"] > div,
 div[data-baseweb="textarea"] > div,
-div[data-baseweb="select"] > div{
-  background: #ffffff !important;
-  border-radius: 12px !important;
-  border: 1px solid var(--hab-border) !important;
-  box-shadow: 0 1px 0 rgba(2, 6, 23, .02);
+div[data-baseweb="select"] > div,
+div[data-baseweb="datepicker"] > div{
+  background: #fff !important;
+  border: 1px solid #cbd5e1 !important;
+  border-radius: 14px !important;
+  box-shadow: none !important;
 }
+
 div[data-baseweb="input"] input,
 div[data-baseweb="textarea"] textarea{
-  color: var(--hab-text) !important;
-}
-label, .stMarkdown, .stTextInput label, .stNumberInput label, .stSelectbox label{
-  color: var(--hab-text) !important;
+  color: var(--text) !important;
+  font-weight: 520 !important;
 }
 
-/* Inputs na sidebar (ficam escuros) */
-section[data-testid="stSidebar"] div[data-baseweb="input"] > div,
-section[data-testid="stSidebar"] div[data-baseweb="textarea"] > div,
-section[data-testid="stSidebar"] div[data-baseweb="select"] > div{
-  background: rgba(255,255,255,.08) !important;
-  border-color: rgba(255,255,255,.14) !important;
-}
-section[data-testid="stSidebar"] div[data-baseweb="input"] input,
-section[data-testid="stSidebar"] div[data-baseweb="textarea"] textarea{
-  color: rgba(255,255,255,.92) !important;
+div[data-baseweb="input"] input::placeholder,
+div[data-baseweb="textarea"] textarea::placeholder{
+  color: #94a3b8 !important;
 }
 
-/* Focus (borda laranja) */
+div[data-baseweb="select"] span{ color: var(--text) !important; }
+div[data-baseweb="select"] svg{ fill: var(--muted) !important; }
+
 div[data-baseweb="input"] > div:focus-within,
 div[data-baseweb="textarea"] > div:focus-within,
-div[data-baseweb="select"] > div:focus-within{
-  border-color: rgba(255,90,0,.90) !important;
-  box-shadow: 0 0 0 3px rgba(255,90,0,.22) !important;
+div[data-baseweb="select"] > div:focus-within,
+div[data-baseweb="datepicker"] > div:focus-within{
+  border-color: var(--hab-orange) !important;
+  box-shadow: 0 0 0 3px rgba(249,115,22,.20) !important;
 }
 
-/* Botões */
-.stButton>button{
-  border-radius: 14px !important;
-  font-weight: 800 !important;
-  border: 1px solid rgba(255,90,0,.30) !important;
+/* Suavizar containers padrão */
+div[data-testid="stVerticalBlock"] > div:has(> div.stMarkdown){
+  border-radius: var(--radius);
 }
-.stButton>button[kind="primary"],
-.stButton>button[data-testid="baseButton-primary"]{
-  background: var(--hab-orange) !important;
-  color: white !important;
-}
-.stButton>button[kind="primary"]:hover,
-.stButton>button[data-testid="baseButton-primary"]:hover{
-  background: var(--hab-orange-2) !important;
-  box-shadow: 0 8px 20px rgba(255,90,0,.22) !important;
-}
-
-/* Dataframes */
-div[data-testid="stDataFrame"]{
-  border-radius: 16px !important;
-  overflow: hidden !important;
-  border: 1px solid var(--hab-border) !important;
-  box-shadow: 0 10px 24px rgba(2, 6, 23, .06) !important;
-}"""
+</style>"""
 
 # ============================
 # Status + cores
@@ -350,66 +330,33 @@ def status_chip(status: str) -> str:
     return f'<span class="hab-chip {cls}">{s}</span>'
 
 def style_status_df(df: pd.DataFrame) -> "pd.io.formats.style.Styler":
-    """Aplica cores por status + formatação numérica BR (sem 'monte de zeros')."""
     color_map = {
-        "Agendado": ("#1d4ed8", "#e8efff"),
-        "Cancelado": ("#b91c1c", "#ffecec"),
-        "Aguardando": ("#92400e", "#fff7ed"),
+        "Agendado": ("#2563eb", "#e8efff"),
+        "Cancelado": ("#dc2626", "#ffecec"),
+        "Aguardando": ("#8a5a00", "#fff3d6"),
         "Confirmado": ("#166534", "#eaffea"),
         "Execucao": ("#166534", "#eaffea"),
         "Concluido": ("#374151", "#f1f5f9"),
     }
-
-    def _fmt_num(v, nd=2):
-        if v is None:
-            return ""
-        try:
-            fv = float(v)
-        except Exception:
-            return str(v)
-        import math
-        if math.isnan(fv):
-            return ""
-        s = f"{fv:.{nd}f}".replace(".", ",")
-        # remove zeros à direita (30,00 -> 30; 100,00 -> 100; 25,50 mantém)
-        if "," in s:
-            s = s.rstrip("0").rstrip(",")
-        return s
-
     def _apply(col: pd.Series):
         styles = []
         for v in col.astype(str).tolist():
             fg, bg = color_map.get(v, ("#374151", "#f1f5f9"))
             styles.append(f"background-color: {bg}; color: {fg}; font-weight: 700;")
         return styles
+    return df.style.apply(_apply, subset=["status"])
 
-    sty = df.style
-
-    # Formatação de números mais "limpa"
-    fmt: dict = {}
-    if "volume_m3" in df.columns:
-        fmt["volume_m3"] = lambda v: _fmt_num(v, 2)
-    if "fck_mpa" in df.columns:
-        fmt["fck_mpa"] = lambda v: _fmt_num(v, 2)
-    if "slump_mm" in df.columns:
-        fmt["slump_mm"] = lambda v: _fmt_num(v, 0)
-    if "duracao_min" in df.columns:
-        fmt["duracao_min"] = lambda v: _fmt_num(v, 0)
-
-    if fmt:
-        sty = sty.format(fmt, na_rep="")
-
-    if "status" in df.columns:
-        sty = sty.apply(_apply, subset=["status"])
-
-    # Cabeçalho com cara Habisolute
-    sty = sty.set_table_styles([
-        {"selector": "th", "props": [("background-color", "#ff5a00"), ("color", "white"), ("font-weight", "800")]},
-        {"selector": "td", "props": [("border-color", "rgba(15,23,42,.08)")]},
-    ])
-
-    return sty
-
+# ============================
+# Time helpers
+# ============================
+def _local_now() -> datetime:
+    """Return 'now' in the configured timezone (fallback to naive local time)."""
+    if ZoneInfo is not None:
+        try:
+            return datetime.now(ZoneInfo(TZ_LABEL))
+        except Exception:
+            pass
+    return datetime.now()
 
 def today_local() -> date:
     return _local_now().date()
@@ -1095,17 +1042,6 @@ def get_concretagens_df(range_start, range_end) -> pd.DataFrame:
 def get_concretagem_by_id(cid: int) -> Dict[str, Any]:
     row = fetch_one(select(concretagens).where(concretagens.c.id == int(cid)))
     return row or {}
-
-def delete_concretagem_by_id(cid: int, user: str) -> None:
-    """Exclui agendamento (concretagem) e registra no histórico."""
-    cid = int(cid)
-    before = get_concretagem_by_id(cid)
-    if not before:
-        return
-    # registra histórico antes de remover
-    add_history(cid, "DELETE", before, None, user)
-    exec_stmt(delete(concretagens).where(concretagens.c.id == cid))
-
 
 def add_history(concretagem_id: int, action: str, before: Any, after: Any, user: str):
     """Registra auditoria no log genérico `historico`.
@@ -1855,20 +1791,6 @@ elif menu == "Histórico":
                     with c2:
                         st.caption("Depois")
                         st.json(after or {})
-                    with st.expander("🗑️ Excluir agendamento", expanded=False):
-                        st.warning("Atenção: a exclusão é permanente e remove o agendamento da agenda.")
-                        confirm = st.text_input("Digite EXCLUIR para confirmar", key=f"del_confirm_{sel_id}")
-                        can_del = (confirm or "").strip().upper() == "EXCLUIR"
-                        if st.button("Confirmar exclusão", key=f"del_btn_{sel_id}", type="primary", disabled=(not can_del)):
-                            delete_concretagem_by_id(int(sel_id), current_user())
-                            st.success("✅ Agendamento excluído.")
-                            try:
-                                st.cache_data.clear()
-                            except Exception:
-                                pass
-                            st.rerun()
-
-
                     st.divider()
 
 # ============================
