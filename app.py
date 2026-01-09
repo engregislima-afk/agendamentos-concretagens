@@ -312,7 +312,12 @@ def get_engine() -> Engine:
     # 1) Fonte da URL do banco
     db_url = None
     try:
-        db_url = st.secrets.get("db_url")
+        db_url = (
+            st.secrets.get("DB_URL")
+            or st.secrets.get("db_url")
+            or st.secrets.get("DATABASE_URL")
+            or st.secrets.get("database_url")
+        )
     except Exception:
         db_url = None
 
@@ -962,14 +967,14 @@ elif menu == "Obras":
                 if not nome.strip():
                     st.error("Informe o nome da obra.")
                 else:
-                    exec_stmt(insert(obras).values(
+                    new_id = exec_stmt(insert(obras).values(
                         nome=nome.strip(),
                         cliente=cliente.strip(),
                         endereco=endereco.strip(),
                         cidade=cidade.strip(),
                         responsavel=responsavel.strip(),
                         telefone=telefone.strip(),
-                        criado_em=now_iso(),
+                        criado_em=_local_now(),
                         cnpj=only_digits(cnpj_clean),
                         razao_social=razao_social.strip(),
                         nome_fantasia=nome_fantasia.strip()
@@ -977,7 +982,11 @@ elif menu == "Obras":
                     for k in list(st.session_state.keys()):
                         if k.startswith("obra_new_"):
                             st.session_state.pop(k, None)
-                    st.success("Obra cadastrada ✅")
+                    st.success("Obra cadastrada ✅" + (f" (ID {new_id})" if new_id else ""))
+                    try:
+                        st.cache_data.clear()
+                    except Exception:
+                        pass
                     st.rerun()
 
         st.markdown('</div>', unsafe_allow_html=True)
