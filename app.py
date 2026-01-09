@@ -287,6 +287,43 @@ def now_iso() -> str:
 def to_dt(d: str, h: str) -> datetime:
     return datetime.strptime(f"{d} {h}", "%Y-%m-%d %H:%M")
 
+def ensure_date(x) -> date:
+    """Coerce inputs (date/datetime/str/Timestamp) to a `datetime.date`.
+    Accepts ISO strings (YYYY-MM-DD) and common BR format (DD/MM/YYYY).
+    """
+    if x is None:
+        return date.today()
+    # pandas Timestamp
+    try:
+        import pandas as _pd
+        if isinstance(x, _pd.Timestamp):
+            x = x.to_pydatetime()
+    except Exception:
+        pass
+    if isinstance(x, datetime):
+        return x.date()
+    if isinstance(x, date):
+        return x
+    if isinstance(x, str):
+        s = x.strip()
+        if not s:
+            return date.today()
+        # ISO
+        try:
+            return date.fromisoformat(s[:10])
+        except Exception:
+            pass
+        # BR
+        try:
+            return datetime.strptime(s[:10], "%d/%m/%Y").date()
+        except Exception:
+            pass
+    # last resort
+    try:
+        return date.fromisoformat(str(x)[:10])
+    except Exception:
+        return date.today()
+
 def overlap(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> bool:
     return max(a_start, b_start) < min(a_end, b_end)
 
