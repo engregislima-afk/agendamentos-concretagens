@@ -965,20 +965,44 @@ def get_concretagem_by_id(cid: int) -> Dict[str, Any]:
     return row or {}
 
 def add_history(concretagem_id: int, action: str, before: Any, after: Any, user: str):
+    """Registra auditoria no log genérico `historico`.
+
+    A tabela `historico` deste app é um log simples (acao, entidade, entidade_id, detalhes, usuario, criado_em).
+    Aqui salvamos before/after dentro de `detalhes` como JSON.
+    """
+    detalhes = {"before": before, "after": after}
     exec_stmt(insert(historico).values(
-        concretagem_id=int(concretagem_id),
-        acao=action,
-        antes_json=json.dumps(before, ensure_ascii=False, default=str) if before is not None else None,
-        depois_json=json.dumps(after, ensure_ascii=False, default=str) if after is not None else None,
-        feito_por=user,
-        feito_em=now_iso()
+        acao=str(action),
+        entidade="concretagens",
+        entidade_id=int(concretagem_id),
+        detalhes=json.dumps(detalhes, ensure_ascii=False, default=str),
+        usuario=str(user or ""),
+        criado_em=now_iso()
     ))
 
 def get_history_df(concretagem_id: int) -> pd.DataFrame:
-    return fetch_df(select(
-        historico.c.id, historico.c.feito_em, historico.c.feito_por, historico.c.acao,
-        historico.c.antes_json, historico.c.depois_json
-    ).where(historico.c.concretagem_id == int(concretagem_id)).order_by(historico.c.id.desc()))
+    # Histórias de concretagem ficam registradas no log genérico `historico`
+    sql = select(
+        historico.c.id,
+        historico.c.criado_em,
+        historico.c.usuario,
+        historico.c.acao,
+        historico.c.detalhes,
+    ).where(
+        (historico.c.entidade == "concretagens") & (historico.c.entidade_id == int(concretagem_id))
+    ).order_by(historico.c.id.desc())
+
+    df = fetch_df(sql)
+
+    # parse detalhes (se for JSON)
+    if not df.empty and "detalhes" in df.columns:
+        def _safe_parse(x):
+            try:
+                return json.loads(x) if isinstance(x, str) else x
+            except Exception:
+                return x
+        df["detalhes"] = df["detalhes"].apply(_safe_parse)
+    return df
 
 def find_conflicts(
     date_iso: str,
@@ -1666,22 +1690,27 @@ elif menu == "Histórico":
 
         hist = get_history_df(sel_id)
         if hist.empty:
-            st.info("Sem histórico.")
+            st.caption("Sem histórico ainda.")
         else:
-            st.dataframe(hist[["feito_em","feito_por","acao"]], use_container_width=True, hide_index=True)
+            view = hist.copy()
+            view = view.rename(columns={"criado_em": "quando", "usuario": "usuário", "acao": "ação"})
+            cols_show = [c for c in ["quando", "usuário", "ação"] if c in view.columns]
+            st.dataframe(view[cols_show], use_container_width=True, hide_index=True)
 
             with st.expander("Ver detalhes (antes/depois)", expanded=False):
-                for _, r in hist.iterrows():
-                    st.markdown(f"**{r['feito_em']}** — {r['feito_por']} — `{r['acao']}`")
-                    try:
-                        a = json.loads(r["antes_json"]) if r.get("antes_json") else None
-                    except Exception:
-                        a = r.get("antes_json")
-                    try:
-                        b = json.loads(r["depois_json"]) if r.get("depois_json") else None
-                    except Exception:
-                        b = r.get("depois_json")
-                    st.code(json.dumps({"antes": a, "depois": b}, ensure_ascii=False, indent=2), language="json")
+                for _, row in hist.iterrows():
+                    det = row.get("detalhes", {})
+                    before = det.get("before") if isinstance(det, dict) else None
+                    after = det.get("after") if isinstance(det, dict) else None
+
+                    st.markdown(f"**#{row.get('id')} — {row.get('acao')} — {row.get('criado_em')} — {row.get('usuario')}**")
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.caption("Antes")
+                        st.json(before or {})
+                    with c2:
+                        st.caption("Depois")
+                        st.json(after or {})
                     st.divider()
 
 # ============================
