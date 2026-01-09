@@ -940,6 +940,9 @@ def get_concretagens_df(range_start, range_end) -> pd.DataFrame:
             c.equipe,
             c.status,
             c.observacoes,
+            c.criado_por as criado_por,
+            c.alterado_por as alterado_por,
+            c.atualizado_em as atualizado_em,
             c.criado_em as created_at
         FROM concretagens c
         LEFT JOIN obras o ON o.id = c.obra_id
@@ -951,7 +954,13 @@ def get_concretagens_df(range_start, range_end) -> pd.DataFrame:
 
     df = pd.DataFrame(rows)
     if df.empty:
-        return df
+        # garante colunas para não quebrar telas (ex.: dashboard) quando não há registros
+        return pd.DataFrame(columns=[
+            'id','obra_id','data','hora_inicio','duracao_min','volume_m3','fck_mpa','slump_mm',
+            'usina','bomba','equipe','status','observacoes',
+            'criado_por','alterado_por','atualizado_em','created_at',
+            'obra','cliente','cidade','responsavel','telefone','cnpj'
+        ])
 
     for col in ("duracao_min", "volume_m3", "fck_mpa", "slump_mm"):
         if col in df.columns:
@@ -959,7 +968,6 @@ def get_concretagens_df(range_start, range_end) -> pd.DataFrame:
 
     df["hora_fim"] = df.apply(lambda r: calc_hora_fim(r.get("hora_inicio"), r.get("duracao_min")), axis=1)
     return df
-
 def get_concretagem_by_id(cid: int) -> Dict[str, Any]:
     row = fetch_one(select(concretagens).where(concretagens.c.id == int(cid)))
     return row or {}
