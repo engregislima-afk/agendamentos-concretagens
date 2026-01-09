@@ -647,7 +647,7 @@ def get_user(username: str) -> Optional[Dict[str, Any]]:
 def list_users() -> pd.DataFrame:
     return fetch_df(select(
         users.c.id, users.c.username, users.c.name, users.c.role,
-        users.c.is_active, users.c.created_at, users.c.last_login_at
+        users.c.is_active, users.c.criado_em as created_at, users.c.last_login_at
     ).order_by(users.c.id.desc()))
 
 def create_user(username: str, name: str, role: str, password: str):
@@ -905,7 +905,7 @@ def get_concretagens_df(range_start, range_end) -> pd.DataFrame:
             c.equipe,
             c.status,
             c.observacoes,
-            c.created_at
+            c.criado_em as created_at
         FROM concretagens c
         LEFT JOIN obras o ON o.id = c.obra_id
         WHERE c.data >= :ds AND c.data <= :de
