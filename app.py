@@ -732,33 +732,46 @@ def get_obras_df() -> pd.DataFrame:
     ).order_by(obras.c.id.desc()))
 
 def get_concretagens_df(range_start: date, range_end: date) -> pd.DataFrame:
+    eng = get_engine()
+
+    # Aceita date/datetime/str (YYYY-MM-DD) para facilitar chamadas do app
+    def _to_date(x):
+        if isinstance(x, date) and not isinstance(x, datetime):
+            return x
+        if isinstance(x, datetime):
+            return x.date()
+        if isinstance(x, str):
+            # suporta 'YYYY-MM-DD' e 'YYYY-MM-DDTHH:MM:SS'
+            return date.fromisoformat(str(x)[:10])
+        # fallback: tenta converter via str()
+        return date.fromisoformat(str(x)[:10])
+
+    range_start = _to_date(range_start)
+    range_end = _to_date(range_end)
+
     ds = range_start.strftime("%Y-%m-%d")
     de = range_end.strftime("%Y-%m-%d")
-
-    eng = get_engine()
-    # Aceita date/datetime/str (YYYY-MM-DD) para facilitar chamadas do app
-    if isinstance(range_start, str):
-        range_start = date.fromisoformat(str(range_start)[:10])
-    elif isinstance(range_start, datetime):
-        range_start = range_start.date()
-    if isinstance(range_end, str):
-        range_end = date.fromisoformat(str(range_end)[:10])
-    elif isinstance(range_end, datetime):
-        range_end = range_end.date()
 
     sql = text("""
         SELECT c.id, c.data, c.hora_inicio, c.duracao_min, c.volume_m3, c.fck_mpa, c.slump_mm,
                c.usina, c.bomba, c.equipe, c.status,
-               c.criado_por, c.alterado_por, c.criado_em, c.atualizado_em,
-               o.nome AS obra, o.cliente, o.cidade, o.id AS obra_id,
-               c.observacoes
+               o.nome as obra_nome, o.endereco as obra_endereco,
+               cl.nome as cliente_nome
         FROM concretagens c
         JOIN obras o ON o.id = c.obra_id
-        WHERE c.data BETWEEN :ds AND :de
-        ORDER BY c.data ASC, c.hora_inicio ASC
+        LEFT JOIN clientes cl ON cl.id = o.cliente_id
+        WHERE c.data >= :ds AND c.data <= :de
+        ORDER BY c.data, c.hora_inicio
     """)
-    with eng.connect() as conn:
-        df = pd.read_sql(sql, conn, params={"ds": ds, "de": de})
+    with eng.connect() as con:
+        rows = con.execute(sql, {"ds": ds, "de": de}).mappings().all()
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    # Garantir tipos
+    df["data"] = pd.to_datetime(df["data"]).dt.date
+    # hora_inicio pode vir como time, string ou None
+    df["hora_inicio"] = df["hora_inicio"].astype(str).replace({"None": ""})
     return df
 
 def get_concretagem_by_id(cid: int) -> Dict[str, Any]:
