@@ -551,63 +551,105 @@ def require_login():
         st.stop()
 
 # ============================
-# CNPJ lookup (cnpj.ws)
+# CNPJ lookup (BrasilAPI + fallbacks)
 # ============================
-def only_digits(s: str) -> str:
-    return "".join(ch for ch in (s or "") if ch.isdigit())
 
-def fetch_cnpj_data(cnpj: str) -> Tuple[bool, str, Dict[str, Any]]:
-    cnpj_digits = only_digits(cnpj)
+@st.cache_data(ttl=24*3600, show_spinner=False)
+def fetch_cnpj_data(cnpj: str):
+    """Busca dados de CNPJ para auto-preencher campos do formulário.
+
+    Prioridade:
+      1) BrasilAPI (gratuito e estável)
+      2) cnpj.ws (legado)
+      3) ReceitaWS (pode ter rate-limit/bloqueios)
+    """
+    if not requests:
+        return None, "Biblioteca 'requests' não disponível."
+
+    cnpj_digits = only_digits(cnpj or "")
     if len(cnpj_digits) != 14:
-        return False, "CNPJ inválido (precisa ter 14 dígitos).", {}
+        return None, "CNPJ inválido (precisa ter 14 dígitos)."
 
-    url = f"https://cnpj.ws/cnpj/{cnpj_digits}"
+    # 1) BrasilAPI
     try:
-        r = requests.get(url, timeout=12)
-        if r.status_code != 200:
-            return False, f"Não foi possível consultar CNPJ (status {r.status_code}).", {}
-        data = r.json()
+        url = f"https://brasilapi.com.br/api/cnpj/v1/{cnpj_digits}"
+        r = requests.get(url, timeout=10, headers={"User-Agent": "Habisolute/1.0"})
+        if r.status_code == 200:
+            j = r.json() or {}
+            data = {
+                "nome": (j.get("razao_social") or j.get("nome") or "").strip(),
+                "fantasia": (j.get("nome_fantasia") or j.get("fantasia") or "").strip(),
+                "logradouro": (j.get("logradouro") or j.get("descricao_tipo_de_logradouro") or "").strip(),
+                "numero": (j.get("numero") or "").strip(),
+                "bairro": (j.get("bairro") or "").strip(),
+                "municipio": (j.get("municipio") or j.get("cidade") or "").strip(),
+                "uf": (j.get("uf") or "").strip(),
+                "cep": (only_digits(j.get("cep") or "") or "").strip(),
+            }
+            return data, None
+        if r.status_code not in (404, 429):
+            return None, f"Falha na consulta BrasilAPI (status {r.status_code})."
+        # 404/429: segue para fallback
     except Exception as e:
-        return False, f"Erro ao consultar CNPJ: {e}", {}
+        # segue para fallback
+        pass
 
-    razao = data.get("razao_social") or ""
-    estab = data.get("estabelecimento") or {}
-    fantasia = estab.get("nome_fantasia") or ""
+    # 2) cnpj.ws (legado — alguns ambientes retornam 404)
+    try:
+        url = f"https://publica.cnpj.ws/cnpj/{cnpj_digits}"
+        r = requests.get(url, timeout=10, headers={"User-Agent": "Habisolute/1.0"})
+        if r.status_code == 200:
+            j = r.json() or {}
+            est = (j.get("estabelecimento") or {})
+            cidade = (est.get("cidade") or {})
+            estado = (cidade.get("estado") or {})
+            data = {
+                "nome": (j.get("razao_social") or "").strip(),
+                "fantasia": (est.get("nome_fantasia") or "").strip(),
+                "logradouro": (est.get("tipo_logradouro") or "").strip() + " " + (est.get("logradouro") or "").strip(),
+                "numero": (est.get("numero") or "").strip(),
+                "bairro": (est.get("bairro") or "").strip(),
+                "municipio": (cidade.get("nome") or "").strip(),
+                "uf": (estado.get("sigla") or "").strip(),
+                "cep": (only_digits(est.get("cep") or "") or "").strip(),
+            }
+            # normalizar espaços duplos
+            data["logradouro"] = " ".join(data["logradouro"].split())
+            return data, None
+        if r.status_code not in (404, 429):
+            return None, f"Falha na consulta cnpj.ws (status {r.status_code})."
+    except Exception:
+        pass
 
-    logradouro = estab.get("tipo_logradouro") or ""
-    nome_log = estab.get("logradouro") or ""
-    numero = estab.get("numero") or ""
-    bairro = estab.get("bairro") or ""
-    cep = estab.get("cep") or ""
-    cidade_obj = estab.get("cidade") or {}
-    estado_obj = estab.get("estado") or {}
+    # 3) ReceitaWS (último recurso)
+    try:
+        url = f"https://www.receitaws.com.br/v1/cnpj/{cnpj_digits}"
+        r = requests.get(url, timeout=15, headers={"User-Agent": "Habisolute/1.0"})
+        if r.status_code == 200:
+            j = r.json() or {}
+            if str(j.get("status", "")).lower() == "error":
+                msg = j.get("message") or "Erro na ReceitaWS."
+                return None, msg
+            data = {
+                "nome": (j.get("nome") or "").strip(),
+                "fantasia": (j.get("fantasia") or "").strip(),
+                "logradouro": (j.get("logradouro") or "").strip(),
+                "numero": (j.get("numero") or "").strip(),
+                "bairro": (j.get("bairro") or "").strip(),
+                "municipio": (j.get("municipio") or "").strip(),
+                "uf": (j.get("uf") or "").strip(),
+                "cep": (only_digits(j.get("cep") or "") or "").strip(),
+            }
+            return data, None
+        return None, f"Não foi possível consultar CNPJ (status {r.status_code})."
+    except Exception as e:
+        return None, f"Não foi possível consultar CNPJ ({type(e).__name__})."
 
-    cidade_nome = cidade_obj.get("nome") or ""
-    uf = estado_obj.get("sigla") or ""
-
-    endereco = " ".join([p for p in [logradouro, nome_log] if p]).strip()
-    if numero:
-        endereco = f"{endereco}, {numero}".strip(", ")
-    if bairro:
-        endereco = f"{endereco} - {bairro}".strip()
-    if cep:
-        endereco = f"{endereco} - CEP {cep}".strip()
-
-    cidade_fmt = " - ".join([p for p in [cidade_nome, uf] if p]).strip(" -")
-
-    payload = {
-        "cnpj": cnpj_digits,
-        "razao_social": razao,
-        "nome_fantasia": fantasia,
-        "endereco": endereco,
-        "cidade": cidade_fmt,
-        "cliente_sugerido": fantasia.strip() or razao.strip()
-    }
-    return True, "OK", payload
 
 # ============================
 # Concretagem helpers
 # ============================
+
 def calc_trucks(volume_m3: float, capacidade_m3: float = 8.0) -> int:
     if volume_m3 <= 0:
         return 0
