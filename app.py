@@ -647,7 +647,7 @@ def get_user(username: str) -> Optional[Dict[str, Any]]:
 def list_users() -> pd.DataFrame:
     return fetch_df(select(
         users.c.id, users.c.username, users.c.name, users.c.role,
-        users.c.is_active, users.c.criado_em as created_at, users.c.last_login_at
+        users.c.is_active, users.c.created_at, users.c.last_login_at
     ).order_by(users.c.id.desc()))
 
 def create_user(username: str, name: str, role: str, password: str):
