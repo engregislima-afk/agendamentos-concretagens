@@ -945,53 +945,104 @@ def get_history_df(concretagem_id: int) -> pd.DataFrame:
         historico.c.antes_json, historico.c.depois_json
     ).where(historico.c.concretagem_id == int(concretagem_id)).order_by(historico.c.id.desc()))
 
-def find_conflicts(date_iso: str, hora_inicio: str, duracao_min: int, ignore_id: Optional[int] = None) -> List[Dict[str, Any]]:
-    """Detecta conflitos (sobreposição de horários) na mesma data."""
+def find_conflicts(
+    date_iso: str,
+    hora_inicio: str,
+    duracao_min: int,
+    bomba: str = "",
+    equipe: str = "",
+    ignore_id: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Detecta conflitos de agenda (sobreposição de horários) para a mesma bomba e/ou equipe no mesmo dia."""
     d = ensure_date(date_iso)
-    ds = d.isoformat()
 
-    def _parse_time(hhmm: str) -> time:
+    def _parse_time(t) -> Optional[time]:
+        if t is None:
+            return None
+        if isinstance(t, time):
+            return t
+        s = str(t).strip()
+        if not s:
+            return None
+        # aceita HH:MM ou HH:MM:SS
         try:
-            hhmm = (hhmm or "").strip()
-            if not hhmm:
-                return time(0, 0)
-            return datetime.strptime(hhmm, "%H:%M").time()
+            parts = s.split(":")
+            hh = int(parts[0])
+            mm = int(parts[1]) if len(parts) > 1 else 0
+            ss = int(parts[2]) if len(parts) > 2 else 0
+            return time(hh, mm, ss)
         except Exception:
-            return time(0, 0)
+            return None
 
-    start_dt = datetime.combine(d, _parse_time(hora_inicio))
-    end_dt = start_dt + timedelta(minutes=int(duracao_min or 0))
+    t0 = _parse_time(hora_inicio)
+    if t0 is None:
+        return []
 
-    eng = get_engine()
-    with eng.connect() as con:
-        stmt = (
-            select(
-                concretagens.c.id,
-                concretagens.c.obra_id,
-                concretagens.c.data,
-                concretagens.c.hora_inicio,
-                concretagens.c.duracao_min,
-                concretagens.c.status,
-                obras.c.nome.label("obra"),
-                obras.c.cliente.label("cliente"),
-                obras.c.cidade.label("cidade"),
-            )
-            .select_from(concretagens.join(obras, obras.c.id == concretagens.c.obra_id, isouter=True))
-            .where(concretagens.c.data == ds)
-        )
-        if ignore_id is not None:
-            stmt = stmt.where(concretagens.c.id != int(ignore_id))
+    try:
+        dur = int(duracao_min or 0)
+    except Exception:
+        dur = 0
 
-        rows = con.execute(stmt).mappings().all()
+    new_start = datetime.combine(d, t0)
+    new_end = new_start + timedelta(minutes=dur)
+
+    nb = (bomba or "").strip().lower()
+    ne = (equipe or "").strip().lower()
+
+    sql = text("""
+        SELECT
+          c.id, c.obra_id, o.nome AS obra,
+          c.data, c.hora_inicio, c.duracao_min,
+          c.bomba, c.equipe
+        FROM concretagens c
+        LEFT JOIN obras o ON o.id = c.obra_id
+        WHERE c.data = :d
+    """)
+    params = {"d": d.isoformat()}
+    if ignore_id is not None:
+        sql = text(str(sql) + " AND c.id <> :ignore_id")
+        params["ignore_id"] = int(ignore_id)
+
+    with get_engine().connect() as con:
+        rows = con.execute(sql, params).mappings().all()
 
     conflicts: List[Dict[str, Any]] = []
     for r in rows:
-        sdt = datetime.combine(d, _parse_time(r.get("hora_inicio") or ""))
-        edt = sdt + timedelta(minutes=int(r.get("duracao_min") or 0))
-        if max(sdt, start_dt) < min(edt, end_dt):
-            rr = dict(r)
-            rr["hora_fim"] = calc_hora_fim(rr.get("hora_inicio"), rr.get("duracao_min"))
-            conflicts.append(rr)
+        # filtra por recurso (bomba/equipe). Se não informar nada, considera qualquer sobreposição do dia.
+        reasons = []
+        rb = (str(r.get("bomba") or "").strip().lower())
+        re = (str(r.get("equipe") or "").strip().lower())
+        if nb and rb == nb:
+            reasons.append("bomba")
+        if ne and re == ne:
+            reasons.append("equipe")
+        if not (nb or ne):
+            reasons = ["agenda"]
+        if not reasons:
+            continue
+
+        ot = _parse_time(r.get("hora_inicio"))
+        if ot is None:
+            continue
+        od = ensure_date(r.get("data"))
+        try:
+            odur = int(r.get("duracao_min") or 0)
+        except Exception:
+            odur = 0
+        old_start = datetime.combine(od, ot)
+        old_end = old_start + timedelta(minutes=odur)
+
+        if new_start < old_end and old_start < new_end:
+            conflicts.append({
+                "id": r.get("id"),
+                "obra_id": r.get("obra_id"),
+                "obra": r.get("obra") or f"Obra #{r.get('obra_id')}",
+                "inicio": str(r.get("hora_inicio")),
+                "duracao_min": odur,
+                "bomba": r.get("bomba"),
+                "equipe": r.get("equipe"),
+                "reasons": reasons,
+            })
 
     return conflicts
 
