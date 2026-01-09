@@ -245,9 +245,20 @@ def get_engine() -> Engine:
                     port = int(u.port or 5432)
 
                     ipv4 = None
-                    for res in socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM):
-                        ipv4 = res[4][0]
-                        break
+                    try:
+                        # 1) try direct IPv4 lookup
+                        for res in socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM):
+                            ipv4 = res[4][0]
+                            break
+                    except Exception:
+                        # 2) fallback: lookup any family and pick the first IPv4
+                        try:
+                            for res in socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM):
+                                if res and res[0] == socket.AF_INET:
+                                    ipv4 = res[4][0]
+                                    break
+                        except Exception:
+                            pass
 
                     if ipv4:
                         user = urllib.parse.unquote(u.username or "")
@@ -262,6 +273,7 @@ def get_engine() -> Engine:
                                 user=user,
                                 password=pwd,
                                 host=ipv4,
+                                connect_timeout=int(os.environ.get('DB_CONNECT_TIMEOUT','10')),
                                 port=port,
                                 sslmode=sslmode,
                             )
