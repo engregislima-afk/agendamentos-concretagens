@@ -42,6 +42,38 @@ def only_digits(s: str) -> str:
     """Return only digits from string (safe for None)."""
     return re.sub(r"\D+", "", str(s or ""))
 
+
+def fmt_br(value, decimals=2, strip_zeros=True):
+    """Formata número para pt-BR (1.234,56) e remove zeros finais."""
+    if value is None:
+        return ""
+    try:
+        v = float(value)
+    except Exception:
+        return str(value)
+    s = f"{v:,.{decimals}f}"
+    # US -> pt-BR
+    s = s.replace(",", "X").replace(".", ",").replace("X", ".")
+    if strip_zeros and "," in s:
+        s = s.rstrip("0").rstrip(",")
+    return s
+
+def format_numbers_in_df(df):
+    """Deixa Volume/FCK/Slump sem aquele monte de zeros nas tabelas."""
+    if df is None:
+        return df
+    try:
+        out = df.copy()
+    except Exception:
+        return df
+    if "volume_m3" in out.columns:
+        out["volume_m3"] = out["volume_m3"].apply(lambda x: fmt_br(x, 2, True))
+    if "fck_mpa" in out.columns:
+        out["fck_mpa"] = out["fck_mpa"].apply(lambda x: fmt_br(x, 0, True))
+    if "slump_mm" in out.columns:
+        out["slump_mm"] = out["slump_mm"].apply(lambda x: fmt_br(x, 0, True))
+    return out
+
 def parse_number(s, default=None):
     """Parse first number from text (accepts comma as decimal). Returns float or default."""
     try:
@@ -169,82 +201,113 @@ TZ_LABEL = "America/Sao_Paulo"
 # ============================
 # Windows 11-ish styling
 # ============================
-WIN11_CSS = """
-<style>
-:root {
-  --bg: #f3f3f3;
-  --card: #ffffff;
-  --text: #1f1f1f;
-  --muted: #5a5a5a;
-  --border: #e7e7e7;
-  --shadow: 0 6px 22px rgba(0,0,0,.08);
-  --radius: 14px;
-  --blue: #2563eb;
-  --red: #dc2626;
-  --yellow: #f59e0b;
-  --green: #16a34a;
-  --gray: #6b7280;
+WIN11_CSS = """<style>
+:root{
+  --hab-orange:#f97316;
+  --hab-orange-dark:#ea580c;
+  --bg:#f6f7fb;
+  --card:#ffffff;
+  --text:#0f172a;
+  --muted:#64748b;
+  --border:#e2e8f0;
+  --shadow:0 10px 30px rgba(2,6,23,.08);
+  --radius:16px;
 }
 
-.stApp {
-  background: var(--bg);
+/* App background */
+html, body, [data-testid="stAppViewContainer"]{
+  background: var(--bg) !important;
+  color: var(--text) !important;
 }
 
-section[data-testid="stSidebar"] {
-  background: #ffffff;
+/* Header */
+[data-testid="stHeader"]{ background: transparent !important; }
+[data-testid="stToolbar"]{ right: 1rem; }
+
+/* Sidebar */
+[data-testid="stSidebar"] > div{
+  background: linear-gradient(180deg,#ffffff 0%,#fbfbfe 100%) !important;
   border-right: 1px solid var(--border);
 }
 
-h1,h2,h3,h4,h5,h6 { color: var(--text); }
-p, li, .stMarkdown { color: var(--text); }
+/* Main padding */
+section.main > div{ padding-top: 1.1rem; padding-bottom: 2.6rem; }
 
-.block-container {
-  padding-top: 1.2rem;
-  padding-bottom: 2rem;
+/* Typography */
+h1,h2,h3{ letter-spacing: -0.02em; }
+label, .stMarkdown, p, span{ color: var(--text) !important; }
+small{ color: var(--muted) !important; }
+
+/* Metrics */
+[data-testid="stMetricValue"]{ font-size: 30px; font-weight: 750; }
+[data-testid="stMetricLabel"]{ color: var(--muted) !important; }
+
+/* Buttons */
+button{ border-radius: 14px !important; }
+button[kind="primary"]{
+  background: var(--hab-orange) !important;
+  border: 1px solid var(--hab-orange) !important;
+  color: #fff !important;
+}
+button[kind="primary"]:hover{
+  background: var(--hab-orange-dark) !important;
+  border-color: var(--hab-orange-dark) !important;
+}
+button[kind="secondary"]{
+  background: #fff !important;
+  border: 1px solid var(--border) !important;
+}
+button[kind="secondary"]:hover{
+  border-color: var(--hab-orange) !important;
+  color: var(--hab-orange-dark) !important;
 }
 
-.hab-card {
-  background: var(--card);
-  border: 1px solid var(--border);
-  box-shadow: var(--shadow);
-  border-radius: var(--radius);
-  padding: 14px 16px;
-}
-
-.hab-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 4px 10px;
-  border-radius: 999px;
-  font-weight: 700;
-  font-size: 12px;
-  border: 1px solid rgba(0,0,0,.06);
-}
-
-.hab-chip.blue { background: rgba(37,99,235,.12); color: var(--blue); }
-.hab-chip.red { background: rgba(220,38,38,.12); color: var(--red); }
-.hab-chip.yellow { background: rgba(245,158,11,.18); color: #8a5a00; }
-.hab-chip.green { background: rgba(22,163,74,.14); color: var(--green); }
-.hab-chip.gray { background: rgba(107,114,128,.14); color: var(--gray); }
-
-.small-muted { color: var(--muted); font-size: 12px; }
-
-[data-testid="stMetricValue"] { font-size: 30px; }
-[data-testid="stMetricLabel"] { color: var(--muted); }
-
-button[kind="primary"] {
-  border-radius: 12px !important;
-}
-
-div[data-testid="stDataFrame"] {
+/* Tables */
+[data-testid="stDataFrame"], [data-testid="stTable"]{
   border-radius: var(--radius);
   overflow: hidden;
   border: 1px solid var(--border);
   box-shadow: var(--shadow);
 }
-</style>
-"""
+
+/* Inputs — deixar visíveis (claro/escuro) */
+div[data-baseweb="input"] > div,
+div[data-baseweb="textarea"] > div,
+div[data-baseweb="select"] > div,
+div[data-baseweb="datepicker"] > div{
+  background: #fff !important;
+  border: 1px solid #cbd5e1 !important;
+  border-radius: 14px !important;
+  box-shadow: none !important;
+}
+
+div[data-baseweb="input"] input,
+div[data-baseweb="textarea"] textarea{
+  color: var(--text) !important;
+  font-weight: 520 !important;
+}
+
+div[data-baseweb="input"] input::placeholder,
+div[data-baseweb="textarea"] textarea::placeholder{
+  color: #94a3b8 !important;
+}
+
+div[data-baseweb="select"] span{ color: var(--text) !important; }
+div[data-baseweb="select"] svg{ fill: var(--muted) !important; }
+
+div[data-baseweb="input"] > div:focus-within,
+div[data-baseweb="textarea"] > div:focus-within,
+div[data-baseweb="select"] > div:focus-within,
+div[data-baseweb="datepicker"] > div:focus-within{
+  border-color: var(--hab-orange) !important;
+  box-shadow: 0 0 0 3px rgba(249,115,22,.20) !important;
+}
+
+/* Suavizar containers padrão */
+div[data-testid="stVerticalBlock"] > div:has(> div.stMarkdown){
+  border-radius: var(--radius);
+}
+</style>"""
 
 # ============================
 # Status + cores
@@ -1185,6 +1248,7 @@ if menu == "Dashboard":
     if df_next.empty:
         st.info("Nenhuma concretagem nos próximos 7 dias.")
     else:
+        df_next = format_numbers_in_df(df_next)
         show = df_next[[
             "data","hora_inicio","obra","cliente","cidade","volume_m3","fck_mpa","slump_mm",
             "usina","bomba","equipe","status","criado_por","alterado_por","atualizado_em"
