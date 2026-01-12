@@ -541,6 +541,7 @@ div[data-testid="stDataFrame"]{
 # Status + cores
 # ============================
 STATUS = ["Agendado", "Aguardando", "Confirmado", "Execucao", "Concluido", "Cancelado"]
+STATUS_LIST = STATUS  # alias para listas/filters
 
 def status_chip(status: str) -> str:
     s = (status or "").strip()
@@ -1739,7 +1740,7 @@ if menu == "Dashboard":
                 f_status = st.multiselect(
                     "Status",
                     STATUS_LIST,
-                    default=["Agendado","Aguardando","Confirmado","Execução"],
+                    default=["Agendado","Aguardando","Confirmado","Execucao"],
                     key=uniq_key("dash_status")
                 )
             with c2:
@@ -1904,14 +1905,14 @@ if menu == "Dashboard":
                         st.success("Status atualizado para Confirmado.")
                         st.rerun()
                 with b2:
-                    if st.button("🚧 Execução", use_container_width=True, disabled=(cur == "Execução"), key=uniq_key("dash_btn_exec")):
-                        update_concretagem_status(int(sel_id), "Execução", user)
-                        st.success("Status atualizado para Execução.")
+                    if st.button("🚧 Execução", use_container_width=True, disabled=(cur == "Execucao"), key=uniq_key("dash_btn_exec")):
+                        update_concretagem_status(int(sel_id), "Execucao", user)
+                        st.success("Status atualizado para Execucao.")
                         st.rerun()
                 with b3:
-                    if st.button("🏁 Concluído", use_container_width=True, disabled=(cur == "Concluído"), key=uniq_key("dash_btn_done")):
-                        update_concretagem_status(int(sel_id), "Concluído", user)
-                        st.success("Status atualizado para Concluído.")
+                    if st.button("🏁 Concluído", use_container_width=True, disabled=(cur == "Concluido"), key=uniq_key("dash_btn_done")):
+                        update_concretagem_status(int(sel_id), "Concluido", user)
+                        st.success("Status atualizado para Concluido.")
                         st.rerun()
                 with b4:
                     if st.button("🛑 Cancelar", use_container_width=True, disabled=(cur == "Cancelado"), key=uniq_key("dash_btn_cancel")):
