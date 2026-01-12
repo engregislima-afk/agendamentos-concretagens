@@ -569,6 +569,23 @@ def to_time(v) -> dt.time:
             pass
     return dt.time(0, 0)
 
+
+def intervals_overlap(ai: dt.time, af: dt.time, bi: dt.time, bf: dt.time) -> bool:
+    """Retorna True se dois intervalos de horário (mesmo dia) se sobrepõem."""
+    try:
+        a0 = ai.hour * 60 + ai.minute
+        a1 = af.hour * 60 + af.minute
+        b0 = bi.hour * 60 + bi.minute
+        b1 = bf.hour * 60 + bf.minute
+    except Exception:
+        return False
+    # garante ordem (caso venha invertido)
+    if a1 < a0:
+        a0, a1 = a1, a0
+    if b1 < b0:
+        b0, b1 = b1, b0
+    return max(a0, b0) < min(a1, b1)
+
 def overlap(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> bool:
     return max(a_start, b_start) < min(a_end, b_end)
 
@@ -2016,7 +2033,7 @@ elif menu == "Histórico":
                         st.json(after or {})
                     with st.expander("🗑️ Excluir agendamento", expanded=False):
                         st.warning("Atenção: a exclusão é permanente e remove o agendamento da agenda.")
-                        confirm = st.text_input("Digite EXCLUIR para confirmar", key=uniq_key(f"del_confirm_{sel_id}"))
+                        confirm = st.text_input("Digite EXCLUIR para confirmar", key=uniq_key(f"hist_del_confirm_{sel_id}"))
                         can_del = (confirm or "").strip().upper() == "EXCLUIR"
                         if st.button("Confirmar exclusão", key=uniq_key(f"hist_del_btn_{sel_id}"), type="primary", disabled=(not can_del)):
                             delete_concretagem_by_id(int(sel_id), current_user())
