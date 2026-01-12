@@ -243,10 +243,13 @@ WIN11_CSS = """/* ============================
 
 /* Centralização / largura */
  .block-container{
-  padding-top: 2.4rem !important;
+  padding-top: 3.6rem !important;
   padding-bottom: 2.2rem !important;
   max-width: 1200px !important;
 }
+/* Título das páginas – descer um pouco */
+h1, h2, h3{ margin-top: .35rem !important; }
+
 
 /* Cards “macios” */
 div[data-testid="stVerticalBlock"] > div:has(> div[data-testid="stMetric"]) {
