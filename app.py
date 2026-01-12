@@ -14,6 +14,7 @@
 #   psycopg2-binary
 
 import os
+import io
 import re
 import json
 import base64
