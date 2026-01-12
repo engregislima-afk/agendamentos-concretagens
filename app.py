@@ -169,11 +169,14 @@ def status_class(status: str) -> str:
         return "hab-badge-red"
     return "hab-badge-slate"
 
-def render_concretagens_cards(df: "pd.DataFrame"):
+def render_concretagens_cards(df: "pd.DataFrame", title: str = ""):
     """Renderiza 'próximas concretagens' em cards (sem scroll horizontal)."""
     if df is None or df.empty:
         st.info("Nenhuma concretagem encontrada para este período/filtro.")
         return
+
+    if title:
+        st.markdown(f"### {title}")
 
     # manter uma ordem amigável
     cols_pref = ["data","hora_inicio","obra","cliente","cidade","volume_m3","fck_mpa","slump_mm","usina","bomba","equipe","status","observacoes"]
