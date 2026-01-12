@@ -18,6 +18,7 @@ import re
 import json
 import base64
 import hashlib
+import uuid
 import secrets
 import urllib.parse
 import socket
@@ -33,6 +34,13 @@ from typing import Optional, Dict, Any, List, Tuple
 import pandas as pd
 import requests
 import streamlit as st
+
+def uniq_key(prefix: str = "k") -> str:
+    """Gera keys únicas por execução para evitar StreamlitDuplicateElementKey."""
+    n = st.session_state.get("_uniq_key_counter", 0) + 1
+    st.session_state["_uniq_key_counter"] = n
+    return f"{prefix}_{n}"
+
 
 
 # =============================================================================
@@ -531,6 +539,34 @@ def ensure_date(x) -> date:
         return date.fromisoformat(str(x)[:10])
     except Exception:
         return date.today()
+
+
+def to_time(v) -> dt.time:
+    """Converte valores variados (str 'HH:MM', datetime, time) para datetime.time."""
+    if v is None:
+        return dt.time(0, 0)
+    if isinstance(v, dt.time) and not isinstance(v, dt.datetime):
+        return v
+    if isinstance(v, dt.datetime):
+        return v.time()
+    s = str(v).strip()
+    if not s:
+        return dt.time(0, 0)
+    for fmt in ("%H:%M", "%H:%M:%S"):
+        try:
+            return dt.datetime.strptime(s, fmt).time()
+        except Exception:
+            pass
+    ds = re.sub(r"\D+", "", s)
+    if len(ds) in (3, 4):
+        try:
+            h = int(ds[:-2])
+            m = int(ds[-2:])
+            if 0 <= h <= 23 and 0 <= m <= 59:
+                return dt.time(h, m)
+        except Exception:
+            pass
+    return dt.time(0, 0)
 
 def overlap(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> bool:
     return max(a_start, b_start) < min(a_end, b_end)
@@ -1979,7 +2015,7 @@ elif menu == "Histórico":
                         st.json(after or {})
                     with st.expander("🗑️ Excluir agendamento", expanded=False):
                         st.warning("Atenção: a exclusão é permanente e remove o agendamento da agenda.")
-                        confirm = st.text_input("Digite EXCLUIR para confirmar", key=f"del_confirm_{sel_id}")
+                        confirm = st.text_input("Digite EXCLUIR para confirmar", key=uniq_key(f"del_confirm_{sel_id}"))
                         can_del = (confirm or "").strip().upper() == "EXCLUIR"
                         if st.button("Confirmar exclusão", key=f"del_btn_{sel_id}", type="primary", disabled=(not can_del)):
                             delete_concretagem_by_id(int(sel_id), current_user())
