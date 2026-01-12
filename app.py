@@ -89,6 +89,38 @@ def format_numbers_in_df(df):
         out["slump_mm"] = out["slump_mm"].apply(lambda x: fmt_br(x, 0, True))
     return out
 
+def style_status_df(df, status_col="status"):
+    """Return a Styler that colors the status column (if present)."""
+    if df is None:
+        return df
+    try:
+        import pandas as _pd  # noqa
+    except Exception:
+        return df
+    if getattr(df, "empty", False) or status_col not in getattr(df, "columns", []):
+        return df
+
+    def _style(v):
+        v = (str(v or "")).strip().lower()
+        if v == "agendado":
+            return "background-color: rgba(59, 130, 246, .18); color: #1d4ed8; font-weight: 700;"
+        if v == "aguardando":
+            return "background-color: rgba(234, 179, 8, .22); color: #a16207; font-weight: 700;"
+        if v == "confirmado":
+            return "background-color: rgba(34, 197, 94, .18); color: #15803d; font-weight: 700;"
+        if v == "execução" or v == "execucao":
+            return "background-color: rgba(16, 185, 129, .18); color: #047857; font-weight: 700;"
+        if v == "concluído" or v == "concluido":
+            return "background-color: rgba(148, 163, 184, .22); color: #334155; font-weight: 700;"
+        if v == "cancelado":
+            return "background-color: rgba(239, 68, 68, .18); color: #b91c1c; font-weight: 700;"
+        return ""
+
+    try:
+        return df.style.applymap(_style, subset=[status_col])
+    except Exception:
+        return df
+
 def parse_number(s, default=None):
     """Parse first number from text (accepts comma as decimal). Returns float or default."""
     try:
@@ -1310,48 +1342,72 @@ menu = st.sidebar.radio(
     ["Dashboard", "Agenda (calendário)", "Novo agendamento", "Agenda (lista)", "Obras", "Histórico", "Admin"],
     index=0
 )
-
-today = today_local()
-week_start = today - timedelta(days=today.weekday())
-week_end = week_start + timedelta(days=6)
-
-# ============================
-# Dashboard
-# ============================
 if menu == "Dashboard":
-    dfw = get_concretagens_df(week_start, week_end)
 
-    colA, colB, colC = st.columns(3)
-    with colA:
-        st.metric("Hoje", today.strftime("%d/%m/%Y"))
-    with colB:
-        st.metric("Semana", f"{week_start.strftime('%d/%m')} → {week_end.strftime('%d/%m')}")
-    with colC:
-        st.caption(f"Timezone: {TZ_LABEL}")
-
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Agendado", int((dfw["status"] == "Agendado").sum()) if not dfw.empty else 0)
-    c2.metric("Aguardando", int((dfw["status"] == "Aguardando").sum()) if not dfw.empty else 0)
-    c3.metric("Confirmado", int((dfw["status"] == "Confirmado").sum()) if not dfw.empty else 0)
-    c4.metric("Execução", int((dfw["status"] == "Execucao").sum()) if not dfw.empty else 0)
-    c5.metric("Concluído", int((dfw["status"] == "Concluido").sum()) if not dfw.empty else 0)
-    c6.metric("Cancelado", int((dfw["status"] == "Cancelado").sum()) if not dfw.empty else 0)
+    today = today_local()
+    week_start = today - timedelta(days=today.weekday())
+    week_end = week_start + timedelta(days=6)
 
     st.subheader("📌 Próximas concretagens (7 dias)")
-    df_next = get_concretagens_df(today, today + timedelta(days=7))
+    df_next = get_next_concretagens_df(7)
+    df_next = format_numbers_in_df(df_next)
+
     if df_next.empty:
-        st.info("Nenhuma concretagem nos próximos 7 dias.")
+        st.info("Nenhuma concretagem agendada nos próximos 7 dias.")
     else:
-        df_next = format_numbers_in_df(df_next)
-        show = df_next[[
-            "data","hora_inicio","obra","cliente","cidade","volume_m3","fck_mpa","slump_mm",
-            "usina","bomba","equipe","status","criado_por","alterado_por","atualizado_em"
-        ]].copy()
+        # --- filtros rápidos ---
+        all_status = []
+        if "status" in df_next.columns:
+            all_status = sorted([s for s in df_next["status"].dropna().unique().tolist() if str(s).strip()])
+
+        with st.expander("🔎 Filtros", expanded=False):
+            f1, f2 = st.columns([2, 2])
+            with f1:
+                dash_q = st.text_input(
+                    "Buscar (obra / cliente / cidade / usina / equipe)",
+                    value="",
+                    placeholder="Ex: Tarraf, Ribeirão, Supermix, Equipe 2…",
+                    key="dash_q",
+                )
+            with f2:
+                dash_status = st.multiselect(
+                    "Status",
+                    options=all_status,
+                    default=all_status,
+                    key="dash_status",
+                )
+
+        df_f = df_next.copy()
+
+        if dash_q:
+            q = dash_q.strip().lower()
+            search_cols = [c for c in ["obra", "cliente", "cidade", "usina", "bomba", "equipe"] if c in df_f.columns]
+            if search_cols:
+                mask = False
+                for c in search_cols:
+                    mask = mask | df_f[c].astype(str).str.lower().str.contains(q, na=False)
+                df_f = df_f[mask]
+
+        if dash_status and "status" in df_f.columns:
+            df_f = df_f[df_f["status"].isin(dash_status)]
+
+        # ordenação padrão
+        sort_cols = [c for c in ["data", "hora_inicio"] if c in df_f.columns]
+        if sort_cols:
+            df_f = df_f.sort_values(sort_cols, ascending=True, na_position="last")
+
+        cols = [
+            "data","hora_inicio","obra","cliente","cidade",
+            "volume_m3","fck_mpa","slump_mm","usina","bomba","equipe","status","criado_por"
+        ]
+        cols = [c for c in cols if c in df_f.columns]
+        show = df_f[cols].copy()
+
         st.dataframe(style_status_df(show), use_container_width=True, hide_index=True)
 
-# ============================
-# Obras (Cadastrar + Editar) + CNPJ
-# ============================
+    # ============================
+    # Obras (Cadastrar + Editar) + CNPJ
+    # ============================
 elif menu == "Obras":
     st.subheader("🏗️ Cadastro de Obras")
 
