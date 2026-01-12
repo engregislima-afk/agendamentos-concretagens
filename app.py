@@ -1387,6 +1387,145 @@ def get_concretagem_by_id(cid: int) -> Dict[str, Any]:
     row = fetch_one(select(concretagens).where(concretagens.c.id == int(cid)))
     return row or {}
 
+
+
+def update_concretagem_status(concretagem_id: int, new_status: str, usuario: str) -> None:
+    """Atualiza somente o status e registra auditoria (historico)."""
+    before = get_concretagem_by_id(int(concretagem_id))
+    if not before:
+        raise ValueError("Concretagem não encontrada.")
+
+    eng = get_engine()
+    with eng.begin() as conn:
+        conn.execute(
+            update(concretagens)
+            .where(concretagens.c.id == int(concretagem_id))
+            .values(
+                status=str(new_status),
+                alterado_por=str(usuario),
+                atualizado_em=now_iso(),
+            )
+        )
+
+    after = get_concretagem_by_id(int(concretagem_id))
+    try:
+        add_history(int(concretagem_id), "STATUS", before, after, str(usuario))
+    except Exception:
+        # auditoria não pode derrubar o app
+        pass
+
+
+def detect_schedule_conflicts(df: pd.DataFrame) -> list[dict]:
+    """Detecta conflitos simples (sobreposição) por equipe e por bomba."""
+    if df is None or df.empty:
+        return []
+
+    required = {"id", "data", "hora_inicio", "duracao_min", "obra", "equipe", "bomba", "status"}
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        return []
+
+    rows = []
+    for _, r in df.iterrows():
+        try:
+            status = str(r.get("status") or "")
+            if status.lower().startswith("cancel"):
+                continue
+            d = str(r.get("data") or "")
+            h = str(r.get("hora_inicio") or "00:00")
+            dur = int(r.get("duracao_min") or 0)
+            st_dt = to_dt(d, h)
+            en_dt = st_dt + dt.timedelta(minutes=max(dur, 0))
+            rows.append({
+                "id": int(r.get("id")),
+                "obra": str(r.get("obra") or ""),
+                "data": d,
+                "hora": h,
+                "inicio": st_dt,
+                "fim": en_dt,
+                "equipe": str(r.get("equipe") or "").strip(),
+                "bomba": str(r.get("bomba") or "").strip(),
+            })
+        except Exception:
+            continue
+
+    def scan(resource_key: str, label: str):
+        out = []
+        groups = {}
+        for x in rows:
+            rk = x.get(resource_key, "").strip()
+            if not rk:
+                continue
+            groups.setdefault(rk, []).append(x)
+        for rk, items in groups.items():
+            items.sort(key=lambda z: z["inicio"])
+            for i in range(1, len(items)):
+                a = items[i-1]; b = items[i]
+                if a["fim"] > b["inicio"]:
+                    out.append({
+                        "tipo": label,
+                        "recurso": rk,
+                        "a": a,
+                        "b": b,
+                    })
+        return out
+
+    conflicts = scan("equipe", "Equipe") + scan("bomba", "Bomba")
+    return conflicts
+
+
+def make_excel_bytes(df: pd.DataFrame, sheet_name: str = "Agendamentos") -> bytes:
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name[:31])
+    return bio.getvalue()
+
+
+def make_pdf_bytes(df: pd.DataFrame, titulo: str = "Agendamentos de Concretagens") -> bytes:
+    """PDF simples (1 página por bloco) com tabela resumida."""
+    try:
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+        from reportlab.lib import colors
+        from reportlab.lib.styles import getSampleStyleSheet
+    except Exception:
+        return b""
+
+    bio = io.BytesIO()
+    doc = SimpleDocTemplate(bio, pagesize=landscape(A4), leftMargin=18, rightMargin=18, topMargin=18, bottomMargin=18)
+    styles = getSampleStyleSheet()
+    story = []
+
+    story.append(Paragraph(f"<b>{titulo}</b>", styles["Title"]))
+    story.append(Spacer(1, 10))
+
+    cols = [c for c in ["data","hora_inicio","obra","cidade","volume_m3","fck_mpa","slump_mm","usina","bomba","equipe","status"] if c in df.columns]
+    data = [cols]
+    for _, r in df[cols].iterrows():
+        row = []
+        for c in cols:
+            v = r.get(c)
+            if isinstance(v, float):
+                row.append(f"{v:.2f}".replace(".", ","))
+            else:
+                row.append("" if v is None else str(v))
+        data.append(row)
+
+    tbl = Table(data, repeatRows=1)
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#0f172a")),
+        ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ("FONTSIZE", (0,0), (-1,0), 9),
+        ("GRID", (0,0), (-1,-1), 0.25, colors.lightgrey),
+        ("FONTSIZE", (0,1), (-1,-1), 8),
+        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+    ]))
+    story.append(tbl)
+
+    doc.build(story)
+    return bio.getvalue()
+
 def delete_concretagem_by_id(cid: int, user: str) -> None:
     """Exclui agendamento (concretagem) e registra no histórico."""
     cid = int(cid)
@@ -1585,84 +1724,201 @@ menu = st.sidebar.radio(
     ["Dashboard", "Agenda (calendário)", "Novo agendamento", "Agenda (lista)", "Obras", "Histórico", "Admin"],
     index=0
 )
+
 if menu == "Dashboard":
-
-    today = today_local()
-    week_start = today - timedelta(days=today.weekday())
-    week_end = week_start + timedelta(days=6)
-
-    st.subheader("📌 Próximas concretagens (7 dias)")
+    st.markdown("## 📌 Próximas concretagens (7 dias)")
     df_next = get_next_concretagens_df(7)
-    df_next = format_numbers_in_df(df_next)
 
     if df_next.empty:
-        st.info("Nenhuma concretagem agendada nos próximos 7 dias.")
+        st.info("Sem concretagens cadastradas para os próximos 7 dias.")
     else:
-        # --- filtros rápidos ---
-        all_status = []
-        if "status" in df_next.columns:
-            all_status = sorted([s for s in df_next["status"].dropna().unique().tolist() if str(s).strip()])
-
+        # -------------------- filtros --------------------
         with st.expander("🔎 Filtros", expanded=False):
-            f1, f2 = st.columns([2, 2])
-            with f1:
-                dash_q = st.text_input(
-                    "Buscar (obra / cliente / cidade / usina / equipe)",
-                    value="",
-                    placeholder="Ex: Tarraf, Ribeirão, Supermix, Equipe 2…",
-                    key="dash_q",
-                )
-            with f2:
-                dash_status = st.multiselect(
+            c1, c2, c3 = st.columns([2,2,2])
+            with c1:
+                f_status = st.multiselect(
                     "Status",
-                    options=all_status,
-                    default=all_status,
-                    key="dash_status",
+                    STATUS_LIST,
+                    default=["Agendado","Aguardando","Confirmado","Execução"],
+                    key=uniq_key("dash_status")
+                )
+            with c2:
+                obras = sorted([o for o in df_next["obra"].dropna().unique().tolist() if str(o).strip()])
+                f_obras = st.multiselect("Obras", obras, default=[], key=uniq_key("dash_obras"))
+            with c3:
+                cidades = sorted([c for c in df_next.get("cidade", pd.Series([], dtype=str)).dropna().unique().tolist() if str(c).strip()])
+                f_cidades = st.multiselect("Cidades", cidades, default=[], key=uniq_key("dash_cidades"))
+
+            c4, c5, c6 = st.columns([2,2,2])
+            with c4:
+                equipes = sorted([e for e in df_next.get("equipe", pd.Series([], dtype=str)).dropna().unique().tolist() if str(e).strip()])
+                f_equipes = st.multiselect("Equipe", equipes, default=[], key=uniq_key("dash_equipes"))
+            with c5:
+                usinas = sorted([u for u in df_next.get("usina", pd.Series([], dtype=str)).dropna().unique().tolist() if str(u).strip()])
+                f_usinas = st.multiselect("Usina/Fornecedor", usinas, default=[], key=uniq_key("dash_usinas"))
+            with c6:
+                modo = st.radio("Visualização", ["Cards (recomendado)", "Tabela"], horizontal=True, index=0, key=uniq_key("dash_mode"))
+
+        show = df_next.copy()
+        if f_status:
+            show = show[show["status"].isin(f_status)]
+        if f_obras:
+            show = show[show["obra"].isin(f_obras)]
+        if f_cidades and "cidade" in show.columns:
+            show = show[show["cidade"].isin(f_cidades)]
+        if f_equipes and "equipe" in show.columns:
+            show = show[show["equipe"].isin(f_equipes)]
+        if f_usinas and "usina" in show.columns:
+            show = show[show["usina"].isin(f_usinas)]
+
+        # -------------------- KPIs --------------------
+        total = int(len(show))
+        total_m3 = float(show["volume_m3"].fillna(0).sum()) if "volume_m3" in show.columns else 0.0
+        qtd_hoje = int((show["data"] == today_local().isoformat()).sum()) if "data" in show.columns else 0
+
+        conflicts = detect_schedule_conflicts(show)
+        qtd_conf = len(conflicts)
+
+        k1, k2, k3, k4 = st.columns([1.1,1.1,1.1,1.1])
+        with k1:
+            st.metric("Concretagens", f"{total}")
+        with k2:
+            st.metric("Volume total", f"{fmt_compact_num(total_m3)} m³")
+        with k3:
+            st.metric("Hoje", f"{qtd_hoje}")
+        with k4:
+            st.metric("Conflitos", f"{qtd_conf}")
+
+        # -------------------- Alertas rápidos --------------------
+        missing_eq = int((show.get("equipe","").fillna("").astype(str).str.strip() == "").sum()) if "equipe" in show.columns else 0
+        missing_us = int((show.get("usina","").fillna("").astype(str).str.strip() == "").sum()) if "usina" in show.columns else 0
+
+        if qtd_conf > 0 or missing_eq > 0 or missing_us > 0:
+            with st.expander("⚠️ Alertas (atenção rápida)", expanded=True):
+                if qtd_conf > 0:
+                    st.warning(f"Foram detectados **{qtd_conf}** possíveis conflitos de agenda (sobreposição por equipe/bomba).")
+                    # listar só os 5 primeiros para não poluir
+                    for c in conflicts[:5]:
+                        a = c["a"]; b = c["b"]
+                        st.write(f"• **{c['tipo']}**: `{c['recurso']}` — ID {a['id']} ({a['data']} {a['hora']}) x ID {b['id']} ({b['data']} {b['hora']})")
+                if missing_eq > 0:
+                    st.info(f"Há **{missing_eq}** agendamento(s) sem **equipe** preenchida.")
+                if missing_us > 0:
+                    st.info(f"Há **{missing_us}** agendamento(s) sem **usina/fornecedor** preenchido.")
+
+        # -------------------- Export --------------------
+        with st.expander("⬇️ Exportar", expanded=False):
+            exp = show.copy()
+            # manter números amigáveis na exportação
+            if "volume_m3" in exp.columns:
+                exp["volume_m3"] = exp["volume_m3"].astype(float).round(2)
+            if "fck_mpa" in exp.columns:
+                exp["fck_mpa"] = exp["fck_mpa"].astype(float).round(1)
+            if "slump_mm" in exp.columns:
+                exp["slump_mm"] = exp["slump_mm"].astype(float).round(0).astype("Int64")
+
+            st.download_button(
+                "📄 Baixar CSV",
+                data=exp.to_csv(index=False).encode("utf-8"),
+                file_name=f"concretagens_7dias_{today_local().isoformat()}.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key=uniq_key("dash_csv"),
+            )
+
+            xbytes = make_excel_bytes(exp, sheet_name="7_dias")
+            st.download_button(
+                "📊 Baixar Excel",
+                data=xbytes,
+                file_name=f"concretagens_7dias_{today_local().isoformat()}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key=uniq_key("dash_xlsx"),
+            )
+
+            pbytes = make_pdf_bytes(exp, titulo="Agendamentos — Próximos 7 dias")
+            if pbytes:
+                st.download_button(
+                    "🧾 Baixar PDF (resumo)",
+                    data=pbytes,
+                    file_name=f"concretagens_7dias_{today_local().isoformat()}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                    key=uniq_key("dash_pdf"),
                 )
 
-        df_f = df_next.copy()
+        # -------------------- Visualização --------------------
+        st.divider()
 
-        if dash_q:
-            q = dash_q.strip().lower()
-            search_cols = [c for c in ["obra", "cliente", "cidade", "usina", "bomba", "equipe"] if c in df_f.columns]
-            if search_cols:
-                mask = False
-                for c in search_cols:
-                    mask = mask | df_f[c].astype(str).str.lower().str.contains(q, na=False)
-                df_f = df_f[mask]
-
-        if dash_status and "status" in df_f.columns:
-            df_f = df_f[df_f["status"].isin(dash_status)]
-
-        # ordenação padrão
-        sort_cols = [c for c in ["data", "hora_inicio"] if c in df_f.columns]
-        if sort_cols:
-            df_f = df_f.sort_values(sort_cols, ascending=True, na_position="last")
-
-        cols = [
-            "data","hora_inicio","obra","cliente","cidade",
-            "volume_m3","fck_mpa","slump_mm","usina","bomba","equipe","status","criado_por"
-        ]
-        cols = [c for c in cols if c in df_f.columns]
-        show = df_f[cols].copy()
-
-        # Visual: cards (sem scroll horizontal) + opção de tabela
+        # preparar versão "de tela" (sem zeros e sem rolagem lateral)
         show_disp = show.copy()
-        for _c in ["volume_m3","fck_mpa","slump_mm"]:
-            if _c in show_disp.columns:
-                show_disp[_c] = show_disp[_c].apply(fmt_compact_num)
+        if "volume_m3" in show_disp.columns:
+            show_disp["volume_m3"] = show_disp["volume_m3"].astype(float).round(2).map(lambda x: str(x).replace(".", ",").rstrip("0").rstrip(",") if pd.notna(x) else "")
+        if "fck_mpa" in show_disp.columns:
+            show_disp["fck_mpa"] = show_disp["fck_mpa"].astype(float).round(1).map(lambda x: str(x).replace(".", ",").rstrip("0").rstrip(",") if pd.notna(x) else "")
+        if "slump_mm" in show_disp.columns:
+            show_disp["slump_mm"] = show_disp["slump_mm"].astype(float).round(0).astype("Int64").astype(str).replace("<NA>", "")
 
-        view = st.radio("Visualização", ["Cards (recomendado)", "Tabela"], horizontal=True, key="dash_view")
-        if view.startswith("Cards"):
-            st.caption("Dica: cards mostram **todas** as informações sem precisar arrastar a tabela.")
-            render_concretagens_cards(show_disp)
+        # modo padrão: cards (mostra tudo sem rolar pro lado)
+        if "modo" not in locals():
+            modo = "Cards (recomendado)"
+
+        if modo.startswith("Cards"):
+            st.caption("📌 Dica: os cards mostram todas as informações **sem precisar arrastar para o lado**.")
+            render_concretagens_cards(show_disp, title="")
         else:
-            st.dataframe(style_status_df(show_disp), use_container_width=True, hide_index=True)
+            cols = [c for c in ["data","hora_inicio","obra","cliente","cidade","volume_m3","fck_mpa","slump_mm","usina","bomba","equipe","status"] if c in show_disp.columns]
+            st.dataframe(
+                show_disp[cols],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "data": st.column_config.TextColumn("Data", width="small"),
+                    "hora_inicio": st.column_config.TextColumn("Hora", width="small"),
+                    "volume_m3": st.column_config.TextColumn("Volume (m³)", width="small"),
+                    "fck_mpa": st.column_config.TextColumn("FCK (MPa)", width="small"),
+                    "slump_mm": st.column_config.TextColumn("Slump (mm)", width="small"),
+                },
+            )
 
+        # -------------------- Ações rápidas --------------------
+        st.divider()
+        with st.expander("⚡ Ações rápidas (status)", expanded=False):
+            if show.empty:
+                st.info("Nenhum item no filtro atual.")
+            else:
+                opt_map = {
+                    int(r["id"]): f"ID {int(r['id'])} — {r.get('data','')} {r.get('hora_inicio','')} — {r.get('obra','')} — {r.get('status','')}"
+                    for _, r in show.iterrows()
+                    if pd.notna(r.get("id"))
+                }
+                sel_id = st.selectbox("Selecione um agendamento", list(opt_map.keys()), format_func=lambda x: opt_map.get(int(x), str(x)), key=uniq_key("dash_sel_id"))
+                row = get_concretagem_by_id(int(sel_id)) or {}
+                cur = str(row.get("status") or "")
 
-    # ============================
-    # Obras (Cadastrar + Editar) + CNPJ
-    # ============================
+                st.write(f"**Status atual:** `{cur}`")
+                b1, b2, b3, b4 = st.columns(4)
+                with b1:
+                    if st.button("✅ Confirmar", use_container_width=True, disabled=(cur == "Confirmado"), key=uniq_key("dash_btn_confirm")):
+                        update_concretagem_status(int(sel_id), "Confirmado", user)
+                        st.success("Status atualizado para Confirmado.")
+                        st.rerun()
+                with b2:
+                    if st.button("🚧 Execução", use_container_width=True, disabled=(cur == "Execução"), key=uniq_key("dash_btn_exec")):
+                        update_concretagem_status(int(sel_id), "Execução", user)
+                        st.success("Status atualizado para Execução.")
+                        st.rerun()
+                with b3:
+                    if st.button("🏁 Concluído", use_container_width=True, disabled=(cur == "Concluído"), key=uniq_key("dash_btn_done")):
+                        update_concretagem_status(int(sel_id), "Concluído", user)
+                        st.success("Status atualizado para Concluído.")
+                        st.rerun()
+                with b4:
+                    if st.button("🛑 Cancelar", use_container_width=True, disabled=(cur == "Cancelado"), key=uniq_key("dash_btn_cancel")):
+                        update_concretagem_status(int(sel_id), "Cancelado", user)
+                        st.success("Status atualizado para Cancelado.")
+                        st.rerun()
+
 elif menu == "Obras":
     st.subheader("🏗️ Cadastro de Obras")
 
