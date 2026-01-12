@@ -465,6 +465,27 @@ def style_status_df(df: pd.DataFrame) -> "pd.io.formats.style.Styler":
     return sty
 
 
+
+def fmt_nozeros(x):
+    try:
+        if x is None or (isinstance(x, float) and pd.isna(x)) or (hasattr(pd, "isna") and pd.isna(x)):
+            return ""
+        # deixa sem zeros finais (ex.: 30.0 -> 30 ; 30.50 -> 30.5)
+        s = f"{float(x):.2f}"
+        s = s.rstrip("0").rstrip(".")
+        return s
+    except Exception:
+        return str(x)
+
+def format_df_numbers(df: pd.DataFrame) -> "pd.io.formats.style.Styler":
+    df2 = df.copy()
+    fmt = {}
+    for c in ["volume_m3", "fck_mpa", "slump_mm", "duracao_min"]:
+        if c in df2.columns:
+            fmt[c] = fmt_nozeros
+    sty = df2.style.format(fmt)
+    return sty
+
 def today_local() -> date:
     return _local_now().date()
 
@@ -1354,6 +1375,12 @@ st.markdown(
 login_box()
 require_login()
 
+
+# Datas base (usadas em várias páginas)
+today = today_local()
+week_start = today - timedelta(days=today.weekday())
+week_end = week_start + timedelta(days=6)
+
 menu = st.sidebar.radio(
     "Menu",
     ["Dashboard", "Agenda (calendário)", "Novo agendamento", "Agenda (lista)", "Obras", "Histórico", "Admin"],
@@ -1577,7 +1604,7 @@ elif menu == "Obras":
         st.info("Nenhuma obra cadastrada.")
     else:
         show = df_obras[["id","nome","cliente","cidade","cnpj","endereco","responsavel","telefone","criado_em"]].copy()
-        st.dataframe(show, use_container_width=True, hide_index=True)
+        st.dataframe(format_df_numbers(show), use_container_width=True, hide_index=True)
 
 # ============================
 # Novo agendamento
