@@ -29,7 +29,6 @@ except Exception:
     ZoneInfo = None
 
 from datetime import datetime, date, time, timedelta
-import datetime as dt
 from typing import Optional, Dict, Any, List, Tuple
 
 import pandas as pd
@@ -2018,7 +2017,7 @@ elif menu == "Histórico":
                         st.warning("Atenção: a exclusão é permanente e remove o agendamento da agenda.")
                         confirm = st.text_input("Digite EXCLUIR para confirmar", key=uniq_key(f"del_confirm_{sel_id}"))
                         can_del = (confirm or "").strip().upper() == "EXCLUIR"
-                        if st.button("Confirmar exclusão", key=f"del_btn_{sel_id}", type="primary", disabled=(not can_del)):
+                        if st.button("Confirmar exclusão", key=uniq_key(f"hist_del_btn_{sel_id}"), type="primary", disabled=(not can_del)):
                             delete_concretagem_by_id(int(sel_id), current_user())
                             st.success("✅ Agendamento excluído.")
                             try:
