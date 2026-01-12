@@ -232,14 +232,18 @@ WIN11_CSS = """/* ============================
   --hab-muted:#64748b;
 }
 
+
+
+/* Títulos um pouco mais abaixo */
+.block-container h1{ margin-top: .25rem !important; }
 /* Fundo geral */
 .stApp{
   background: linear-gradient(180deg, #fff7ed 0%, #ffffff 40%, #f8fafc 100%) !important;
 }
 
 /* Centralização / largura */
-.block-container{
-  padding-top: 1.2rem !important;
+ .block-container{
+  padding-top: 2.4rem !important;
   padding-bottom: 2.2rem !important;
   max-width: 1200px !important;
 }
