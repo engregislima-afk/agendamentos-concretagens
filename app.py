@@ -1146,6 +1146,23 @@ def get_concretagens_df(range_start, range_end) -> pd.DataFrame:
 
     df["hora_fim"] = df.apply(lambda r: calc_hora_fim(r.get("hora_inicio"), r.get("duracao_min")), axis=1)
     return df
+
+def get_next_concretagens_df(days: int = 7) -> pd.DataFrame:
+    """Retorna concretagens previstas a partir de hoje (inclusive) pelos próximos `days` dias."""
+    try:
+        ds = today_local()
+    except Exception:
+        ds = date.today()
+    de = ds + timedelta(days=int(days))
+    df = get_concretagens_df(ds, de)
+
+    # ordenação estável para telas (dashboard / agenda)
+    sort_cols = [c for c in ("data", "hora_inicio", "obra") if c in df.columns]
+    if sort_cols:
+        df = df.sort_values(sort_cols, ascending=True, kind="stable")
+    return df
+
+
 def get_concretagem_by_id(cid: int) -> Dict[str, Any]:
     row = fetch_one(select(concretagens).where(concretagens.c.id == int(cid)))
     return row or {}
