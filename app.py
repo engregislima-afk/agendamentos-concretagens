@@ -130,6 +130,101 @@ def style_status_df(df, status_col="status"):
     except Exception:
         return df
 
+
+def fmt_compact_num(v, decimals: int = 2) -> str:
+    """Formata números sem aquele monte de zeros (30.000000 -> 30, 25.50 -> 25.5)."""
+    try:
+        if v is None:
+            return ""
+        if isinstance(v, str):
+            s = v.strip()
+            if s == "":
+                return ""
+            # aceitar vírgula
+            s = s.replace(".", "").replace(",", ".") if ("," in s and s.count(",") == 1 and s.count(".") > 1) else s.replace(",", ".")
+            v = float(s)
+        fv = float(v)
+        if math.isfinite(fv) is False:
+            return ""
+        if abs(fv - round(fv)) < 1e-9:
+            return str(int(round(fv)))
+        return f"{fv:.{decimals}f}".rstrip("0").rstrip(".")
+    except Exception:
+        return str(v)
+
+def status_class(status: str) -> str:
+    s = (status or "").strip().lower()
+    if s in ("agendado",):
+        return "hab-badge-blue"
+    if s in ("aguardando",):
+        return "hab-badge-amber"
+    if s in ("confirmado",):
+        return "hab-badge-green"
+    if s in ("execucao", "execução"):
+        return "hab-badge-purple"
+    if s in ("concluido", "concluído"):
+        return "hab-badge-slate"
+    if s in ("cancelado",):
+        return "hab-badge-red"
+    return "hab-badge-slate"
+
+def render_concretagens_cards(df: "pd.DataFrame"):
+    """Renderiza 'próximas concretagens' em cards (sem scroll horizontal)."""
+    if df is None or df.empty:
+        st.info("Nenhuma concretagem encontrada para este período/filtro.")
+        return
+
+    # manter uma ordem amigável
+    cols_pref = ["data","hora_inicio","obra","cliente","cidade","volume_m3","fck_mpa","slump_mm","usina","bomba","equipe","status","observacoes"]
+    for c in cols_pref:
+        if c not in df.columns:
+            df[c] = ""
+
+    for _, r in df.iterrows():
+        data = str(r.get("data","") or "")
+        hora = str(r.get("hora_inicio","") or "")
+        obra = str(r.get("obra","") or "")
+        cliente = str(r.get("cliente","") or "")
+        cidade = str(r.get("cidade","") or "")
+        vol = fmt_compact_num(r.get("volume_m3",""))
+        fck = fmt_compact_num(r.get("fck_mpa",""))
+        slump = fmt_compact_num(r.get("slump_mm",""))
+        usina = str(r.get("usina","") or "").strip()
+        bomba = str(r.get("bomba","") or "").strip()
+        equipe = str(r.get("equipe","") or "").strip()
+        status = str(r.get("status","") or "").strip() or "-"
+        obs = str(r.get("observacoes","") or "").strip()
+
+        badge_cls = status_class(status)
+
+        # linhas auxiliares
+        sub_left = " • ".join([x for x in [cliente, cidade] if x])
+        sup = " | ".join([x for x in [("Usina: "+usina) if usina else "", ("Bomba: "+bomba) if bomba else "", ("Equipe: "+equipe) if equipe else ""] if x])
+
+        st.markdown(
+            f"""
+            <div class="hab-row-card">
+              <div class="hab-row-top">
+                <div class="hab-row-when">📅 <b>{data}</b> &nbsp;•&nbsp; ⏱️ <b>{hora}</b></div>
+                <div class="hab-badge {badge_cls}">{status}</div>
+              </div>
+              <div class="hab-row-main">
+                <div class="hab-row-title">{obra}</div>
+                <div class="hab-row-sub">{sub_left}</div>
+              </div>
+              <div class="hab-row-grid">
+                <div><span class="hab-k">Volume</span><span class="hab-v">{vol} m³</span></div>
+                <div><span class="hab-k">FCK</span><span class="hab-v">{fck} MPa</span></div>
+                <div><span class="hab-k">Slump</span><span class="hab-v">{slump} mm</span></div>
+                <div><span class="hab-k">Operação</span><span class="hab-v">{sup if sup else "-"}</span></div>
+              </div>
+              {f'<div class="hab-row-obs">📝 {obs}</div>' if obs else ''}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
 def parse_number(s, default=None):
     """Parse first number from text (accepts comma as decimal). Returns float or default."""
     try:
@@ -390,7 +485,57 @@ div[data-testid="stDataFrame"]{
   overflow: hidden !important;
   border: 1px solid var(--hab-border) !important;
   box-shadow: 0 10px 24px rgba(2, 6, 23, .06) !important;
-}"""
+}
+
+/* Cards de listagem (Dashboard) */
+.hab-row-card{
+  background: var(--hab-card);
+  border: 1px solid var(--hab-border);
+  border-radius: 16px;
+  padding: 14px 16px;
+  box-shadow: 0 10px 24px rgba(2, 6, 23, .06);
+  margin-bottom: 12px;
+}
+.hab-row-top{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+  margin-bottom: 8px;
+}
+.hab-row-when{ color: var(--hab-text); font-size: 14px; }
+.hab-row-main{ margin-bottom: 10px; }
+.hab-row-title{ font-weight: 900; color: var(--hab-text); font-size: 16px; line-height: 1.2; }
+.hab-row-sub{ color: var(--hab-muted); font-size: 13px; margin-top: 3px; }
+.hab-row-grid{
+  display:grid;
+  grid-template-columns: 1fr 1fr 1fr 2fr;
+  gap: 10px 14px;
+}
+.hab-k{ display:block; font-size: 11px; color: var(--hab-muted); text-transform: uppercase; letter-spacing: .04em; }
+.hab-v{ display:block; font-weight: 800; color: var(--hab-text); font-size: 13px; margin-top: 2px; word-break: break-word; }
+.hab-row-obs{ margin-top: 10px; padding-top: 10px; border-top: 1px dashed rgba(15, 23, 42, .12); color: var(--hab-text); font-size: 13px; }
+
+/* Badges status */
+.hab-badge{
+  padding: 6px 10px;
+  border-radius: 999px;
+  font-weight: 900;
+  font-size: 12px;
+  border: 1px solid rgba(15, 23, 42, .12);
+}
+.hab-badge-blue{ background: rgba(59,130,246,.14); color: #1d4ed8; border-color: rgba(59,130,246,.30); }
+.hab-badge-amber{ background: rgba(245,158,11,.18); color: #b45309; border-color: rgba(245,158,11,.32); }
+.hab-badge-green{ background: rgba(34,197,94,.16); color: #166534; border-color: rgba(34,197,94,.28); }
+.hab-badge-purple{ background: rgba(139,92,246,.16); color: #5b21b6; border-color: rgba(139,92,246,.28); }
+.hab-badge-slate{ background: rgba(100,116,139,.14); color: #334155; border-color: rgba(100,116,139,.26); }
+.hab-badge-red{ background: rgba(239,68,68,.16); color: #b91c1c; border-color: rgba(239,68,68,.28); }
+
+/* responsivo */
+@media (max-width: 900px){
+  .hab-row-grid{ grid-template-columns: 1fr 1fr; }
+}
+"""
 
 # ============================
 # Status + cores
@@ -1501,7 +1646,19 @@ if menu == "Dashboard":
         cols = [c for c in cols if c in df_f.columns]
         show = df_f[cols].copy()
 
-        st.dataframe(style_status_df(show), use_container_width=True, hide_index=True)
+        # Visual: cards (sem scroll horizontal) + opção de tabela
+        show_disp = show.copy()
+        for _c in ["volume_m3","fck_mpa","slump_mm"]:
+            if _c in show_disp.columns:
+                show_disp[_c] = show_disp[_c].apply(fmt_compact_num)
+
+        view = st.radio("Visualização", ["Cards (recomendado)", "Tabela"], horizontal=True, key="dash_view")
+        if view.startswith("Cards"):
+            st.caption("Dica: cards mostram **todas** as informações sem precisar arrastar a tabela.")
+            render_concretagens_cards(show_disp)
+        else:
+            st.dataframe(style_status_df(show_disp), use_container_width=True, hide_index=True)
+
 
     # ============================
     # Obras (Cadastrar + Editar) + CNPJ
