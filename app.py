@@ -24,6 +24,7 @@ import secrets
 import urllib.parse
 import socket
 
+import math
 try:
     from zoneinfo import ZoneInfo
 except Exception:
@@ -329,6 +330,7 @@ concretagens = Table(
     Column("usina", String(200), nullable=True),
     Column("bomba", String(200), nullable=True),
     Column("equipe", String(200), nullable=True),
+        Column("colab_qtd", Integer, nullable=True),
 
     Column("status", String(40), nullable=True),
 
@@ -350,6 +352,16 @@ historico = Table(
     Column("usuario", String(120), nullable=True),
     Column("criado_em", String(40), nullable=True),
 )
+
+config = Table(
+    "config",
+    metadata,
+    Column("chave", String(80), primary_key=True),
+    Column("valor", String(250), nullable=True),
+    Column("atualizado_em", String(40), nullable=True),
+    Column("atualizado_por", String(120), nullable=True),
+)
+
 from sqlalchemy.engine import Engine
 
 TZ_LABEL = "America/Sao_Paulo"
@@ -650,6 +662,87 @@ def today_local() -> date:
 
 def now_iso() -> str:
     return _local_now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def get_config_value(key: str, default: str | None = None) -> str | None:
+    """Lê um valor simples da tabela config (key/value)."""
+    try:
+        eng = get_engine()
+        sql = text("SELECT valor FROM config WHERE chave = :k")
+        with eng.connect() as con:
+            row = con.execute(sql, {'k': key}).mappings().first()
+        if row and row.get('valor') is not None:
+            return str(row['valor'])
+        return default
+    except Exception:
+        return default
+
+def set_config_value(key: str, value: str, user: str = 'system') -> None:
+    """Salva um valor simples na tabela config (upsert)."""
+    eng = get_engine()
+    ts = now_iso()
+    with eng.begin() as con:
+        if con.dialect.name == 'postgresql':
+            sql = text(
+                """
+                INSERT INTO config (chave, valor, atualizado_em, atualizado_por)
+                VALUES (:k, :v, :ts, :u)
+                ON CONFLICT (chave)
+                DO UPDATE SET valor = EXCLUDED.valor, atualizado_em = EXCLUDED.atualizado_em, atualizado_por = EXCLUDED.atualizado_por
+                """
+            )
+            con.execute(sql, {'k': key, 'v': str(value), 'ts': ts, 'u': user})
+        else:
+            sql = text(
+                """
+                INSERT OR REPLACE INTO config (chave, valor, atualizado_em, atualizado_por)
+                VALUES (:k, :v, :ts, :u)
+                """
+            )
+            con.execute(sql, {'k': key, 'v': str(value), 'ts': ts, 'u': user})
+
+def get_team_capacity(default: int = 12) -> int:
+    v = get_config_value('capacidade_colaboradores', str(default))
+    try:
+        n = int(float(str(v).strip()))
+        return max(1, n)
+    except Exception:
+        return default
+
+def _norm_status(s: str) -> str:
+    s = str(s or "").strip().lower()
+    # remoção simples de acentos comuns em PT-BR
+    trans = str.maketrans({
+        "á":"a","à":"a","â":"a","ã":"a",
+        "é":"e","ê":"e",
+        "í":"i",
+        "ó":"o","ô":"o","õ":"o",
+        "ú":"u",
+        "ç":"c",
+    })
+    return s.translate(trans)
+
+_COMMITTED = {"agendado", "aguardando", "confirmado", "execucao"}
+
+def is_committed_status(status: str) -> bool:
+    return _norm_status(status) in _COMMITTED
+
+def get_committed_collaborators(date_str: str) -> int:
+    """Soma colab_qtd do dia (apenas status em atendimento: Agendado/Aguardando/Confirmado/Execucao)."""
+    try:
+        eng = get_engine()
+        sql = text(
+            """
+            SELECT COALESCE(SUM(COALESCE(colab_qtd, 1)), 0) AS total
+            FROM concretagens
+            WHERE data = :d AND COALESCE(status,'') IN ('Agendado','Aguardando','Confirmado','Execucao','Execução')
+            """
+        )
+        with eng.connect() as con:
+            row = con.execute(sql, {'d': date_str}).mappings().first()
+        return int(row['total']) if row and row.get('total') is not None else 0
+    except Exception:
+        return 0
 
 def to_dt(d: str, h: str) -> datetime:
     return datetime.strptime(f"{d} {h}", "%Y-%m-%d %H:%M")
@@ -958,22 +1051,47 @@ def migrate_schema(eng):
                     pass
 
 def migrate_schema(eng):
-    """Best-effort schema migrations (keeps app working on existing DBs)."""
-    try:
-        with eng.begin() as conn:
-            if eng.dialect.name == "sqlite":
-                # SQLite: no IF NOT EXISTS for ADD COLUMN in older versions
-                rows = conn.execute(text("PRAGMA table_info(concretagens)")).fetchall()
-                cols = {r[1] for r in rows}
-                if "slump_txt" not in cols:
-                    conn.execute(text("ALTER TABLE concretagens ADD COLUMN slump_txt TEXT"))
-            else:
-                # Postgres
-                conn.execute(text("ALTER TABLE concretagens ADD COLUMN IF NOT EXISTS slump_txt TEXT"))
-    except Exception:
-        # If migration fails, app still runs; worst case: we just won’t store slump_txt.
-        pass
+    """Pequenas migrações incrementais (SQLite/Postgres).
+    Mantém compatibilidade com DBs já existentes."""
+    with eng.begin() as conn:
+        if eng.dialect.name == "sqlite":
+            # listar colunas existentes
+            cols = [r[1] for r in conn.execute(text("PRAGMA table_info(concretagens)")).fetchall()]
 
+            def add_col(name: str, ddl: str):
+                if name not in cols:
+                    conn.execute(text(f"ALTER TABLE concretagens ADD COLUMN {ddl}"))
+
+            add_col("slump_txt", "slump_txt TEXT")
+            add_col("colab_qtd", "colab_qtd INTEGER DEFAULT 1")
+            add_col("cap_caminhao_m3", "cap_caminhao_m3 REAL")
+            add_col("cps_por_caminhao", "cps_por_caminhao INTEGER DEFAULT 4")
+            add_col("caminhoes_est", "caminhoes_est INTEGER")
+            add_col("formas_est", "formas_est INTEGER")
+
+        elif eng.dialect.name in ("postgresql", "postgres"):
+            # Postgres: checar colunas via information_schema
+            existing = {
+                r[0]
+                for r in conn.execute(text("""
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_name='concretagens'
+                """)).fetchall()
+            }
+
+            def add_col(name: str, ddl: str):
+                if name not in existing:
+                    conn.execute(text(f"ALTER TABLE concretagens ADD COLUMN {ddl}"))
+
+            add_col("slump_txt", "slump_txt TEXT")
+            add_col("colab_qtd", "colab_qtd INTEGER DEFAULT 1")
+            add_col("cap_caminhao_m3", "cap_caminhao_m3 DOUBLE PRECISION")
+            add_col("cps_por_caminhao", "cps_por_caminhao INTEGER DEFAULT 4")
+            add_col("caminhoes_est", "caminhoes_est INTEGER")
+            add_col("formas_est", "formas_est INTEGER")
+
+        # config table will be created by metadata.create_all() if missing.
 def init_db():
     eng = get_engine()
     # Testa conexão antes de tentar criar tabelas (evita crash "mudo" no Cloud)
@@ -1333,6 +1451,11 @@ def get_concretagens_df(range_start, range_end) -> pd.DataFrame:
             c.slump_mm,
             c.bomba,
             c.equipe,
+            c.colab_qtd,
+            c.cap_caminhao_m3,
+            c.cps_por_caminhao,
+            c.caminhoes_est,
+            c.formas_est,
             c.status,
             c.observacoes,
             c.criado_por as criado_por,
@@ -1729,6 +1852,18 @@ menu = st.sidebar.radio(
     ["Dashboard", "Agenda (calendário)", "Novo agendamento", "Agenda (lista)", "Obras", "Histórico", "Admin"],
     index=0
 )
+
+# Indicador global de capacidade diária (fica 'aceso' quando lota)
+try:
+    _cap = get_team_capacity()
+    _comm = get_committed_collaborators(today_local().isoformat())
+    if _comm >= _cap:
+        st.sidebar.markdown(f"### 🚨 Capacidade hoje\n**{_comm} / {_cap} colaboradores**\n\n✅ Alertas: **ATIVO**")
+    else:
+        st.sidebar.markdown(f"### ⚡ Capacidade hoje\n**{_comm} / {_cap} colaboradores**")
+except Exception:
+    pass
+
 
 if menu == "Dashboard":
     st.markdown("## 📌 Próximas concretagens (7 dias)")
@@ -2223,11 +2358,20 @@ elif menu == "Novo agendamento":
             usina = st.text_input("Usina / Fornecedor", value="")
             bomba = st.text_input("Bomba (ID/placa/empresa)", value="")
             equipe = st.text_input("Equipe (ex: Equipe 1 / Técnico X)", value="")
+            colab_qtd = st.number_input("Colaboradores na obra (qtd)", min_value=1, step=1, value=1)
             status = st.selectbox("Status", STATUS, index=STATUS.index("Agendado"))
             obs = st.text_area("Observações", value="")
-
-            cap = st.number_input("Capacidade caminhão (m³) p/ estimativa", min_value=4.0, value=8.0, step=0.5)
-            st.caption(f"Estimativa: **{calc_trucks(volume, cap)} caminhões** (capacidade {cap} m³).")
+            cap = st.number_input("Capacidade caminhão (m³) p/ estimativa", min_value=1.0, max_value=30.0, value=8.0, step=0.5)
+            cps_por_cam = st.number_input("Corpos de prova por caminhão (séries)", min_value=1, max_value=10, value=4, step=1)
+            caminhaos_est = calc_trucks(float(volume or 0.0), float(cap or 8.0))
+            formas_est = int(caminhaos_est) * int(cps_por_cam or 0)
+            st.caption(f"Estimativa: **{caminhaos_est} caminhões** (cap. {fmt_compact_num(cap)} m³) • **{formas_est} formas** (CP/caminhão: {int(cps_por_cam)})")
+            # alerta de capacidade (não bloqueia)
+            _cap_total = get_team_capacity(12)
+            _committed = get_committed_collaborators(d.strftime("%Y-%m-%d"))
+            _projected = int(_committed) + int(colab_qtd or 1)
+            if _projected > int(_cap_total):
+                st.warning(f"⚠️ Este agendamento deixa o dia acima da capacidade: {_projected}/{_cap_total} colaboradores comprometidos.")
 
             salvar = st.form_submit_button("Salvar agendamento", use_container_width=True, type="primary")
 
@@ -2238,10 +2382,9 @@ elif menu == "Novo agendamento":
 
                 conflicts = find_conflicts(data_str, hora_str, int(dur), bomba, equipe, ignore_id=None)
                 if conflicts:
-                    st.error("Conflito detectado (mesma bomba/equipe no mesmo horário).")
+                    st.warning("⚠️ Conflito detectado (mesma bomba/equipe no mesmo horário). Você ainda pode salvar mesmo assim.")
                     st.dataframe(pd.DataFrame(conflicts), use_container_width=True, hide_index=True)
-                    st.stop()
-
+                    
                 user = current_user()
                 now = now_iso()
 
@@ -2357,6 +2500,26 @@ elif menu == "Agenda (lista)":
             with c8:
                 new_fck = st.number_input("FCK (MPa)", min_value=0.0, value=float(row.get("fck_mpa") or 0.0), step=1.0)
 
+            c9, c10 = st.columns(2)
+            with c9:
+                new_colab_qtd = st.number_input("Colaboradores na obra (qtd)", min_value=1, step=1, value=int(row.get("colab_qtd") or 1))
+            with c10:
+                new_cap = st.number_input("Capacidade caminhão (m³) p/ estimativa", min_value=1.0, max_value=30.0, value=float(row.get("cap_caminhao_m3") or 8.0), step=0.5)
+
+            c11, c12 = st.columns(2)
+            with c11:
+                new_cps_por_cam = st.number_input("Corpos de prova por caminhão (séries)", min_value=1, max_value=10, value=int(row.get("cps_por_caminhao") or 4), step=1)
+            with c12:
+                new_caminhoes_est = calc_trucks(float(new_volume or 0.0), float(new_cap or 8.0))
+                new_formas_est = int(new_caminhoes_est) * int(new_cps_por_cam or 0)
+                st.caption(f"Estimativa: **{new_caminhoes_est} caminhões** (cap. {fmt_compact_num(new_cap)} m³) • **{new_formas_est} formas** (CP/caminhão: {int(new_cps_por_cam)})")
+
+            _cap_total_edit = get_team_capacity(12)
+            _committed_edit = get_committed_collaborators(str(row.get("data") or ""))
+            _projected_edit = int(_committed_edit) - int(row.get("colab_qtd") or 1) + int(new_colab_qtd or 1)
+            if _projected_edit > int(_cap_total_edit):
+                st.warning(f"⚠️ Este ajuste deixa o dia acima da capacidade: {_projected_edit}/{_cap_total_edit} colaboradores comprometidos.")
+
             new_obs = st.text_area("Observações", value=str(row.get("observacoes") or ""))
 
             salvar = st.form_submit_button("Salvar alterações", use_container_width=True, type="primary")
@@ -2368,10 +2531,9 @@ elif menu == "Agenda (lista)":
 
                 conflicts = find_conflicts(data_str, hora_str, int(new_dur), new_bomba, new_equipe, ignore_id=int(sel_id))
                 if conflicts:
-                    st.error("Conflito detectado (mesma bomba/equipe no mesmo horário).")
+                    st.warning("⚠️ Conflito detectado (mesma bomba/equipe no mesmo horário). Você ainda pode salvar mesmo assim.")
                     st.dataframe(pd.DataFrame(conflicts), use_container_width=True, hide_index=True)
-                    st.stop()
-
+                    
                 user = current_user()
                 now = now_iso()
 
@@ -2475,7 +2637,15 @@ elif menu == "Admin":
         st.error("Acesso restrito ao perfil admin.")
         st.stop()
 
-    tab1, tab2, tab3 = st.tabs(["Usuários", "Alterar minha senha", "Exportar"])
+    tab0, tab1, tab2, tab3 = st.tabs(["Capacidade", "Usuários", "Alterar minha senha", "Exportar"])
+
+    with tab0:
+        st.subheader("Capacidade diária")
+        cap_atual = get_team_capacity(12)
+        novo = st.number_input("Colaboradores disponíveis por dia", min_value=1, step=1, value=int(cap_atual))
+        if st.button("Salvar capacidade", use_container_width=True):
+            config_set_int("team_capacity", int(novo))
+            st.success("Capacidade salva.")
 
     with tab1:
         st.markdown("### 👥 Usuários")
