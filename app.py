@@ -678,7 +678,7 @@ def get_config_value(key: str, default: str | None = None) -> str | None:
         return default
 
 def set_config_value(key: str, value: str, user: str = 'system') -> None:
-    """Salva um valor simples na tabela config (upsert)."""
+    """Salva um valor simples na tabela config (upsert compatível com Postgres e SQLite)."""
     eng = get_engine()
     ts = now_iso()
     with eng.begin() as con:
@@ -688,26 +688,65 @@ def set_config_value(key: str, value: str, user: str = 'system') -> None:
                 INSERT INTO config (chave, valor, atualizado_em, atualizado_por)
                 VALUES (:k, :v, :ts, :u)
                 ON CONFLICT (chave)
-                DO UPDATE SET valor = EXCLUDED.valor, atualizado_em = EXCLUDED.atualizado_em, atualizado_por = EXCLUDED.atualizado_por
+                DO UPDATE SET
+                    valor = EXCLUDED.valor,
+                    atualizado_em = EXCLUDED.atualizado_em,
+                    atualizado_por = EXCLUDED.atualizado_por
                 """
             )
-            con.execute(sql, {'k': key, 'v': str(value), 'ts': ts, 'u': user})
         else:
+            # SQLite
             sql = text(
                 """
                 INSERT OR REPLACE INTO config (chave, valor, atualizado_em, atualizado_por)
                 VALUES (:k, :v, :ts, :u)
                 """
             )
-            con.execute(sql, {'k': key, 'v': str(value), 'ts': ts, 'u': user})
+        con.execute(sql, {'k': key, 'v': str(value), 'ts': ts, 'u': user})
+
+
+# -----------------------------------------------------------------------------
+# Config helpers (typed) — wrappers para evitar NameError e padronizar o uso
+# -----------------------------------------------------------------------------
+def _cfg_user_fallback() -> str:
+    """Usuário para auditoria quando `current_user()` não estiver disponível."""
+    try:
+        u = st.session_state.get("user") or {}
+        return str(u.get("username") or "system")
+    except Exception:
+        return "system"
+
+
+def config_get_int(key: str, default: int = 0) -> int:
+    """Lê uma configuração como inteiro."""
+    v = get_config_value(key)
+    if (v is None or str(v).strip() == "") and key == "team_capacity":
+        # compatibilidade com chave antiga
+        v = get_config_value("capacidade_colaboradores")
+    try:
+        return int(float(str(v).strip().replace(",", ".")))
+    except Exception:
+        return int(default)
+
+
+def config_set_int(key: str, value: int, user: Optional[str] = None) -> None:
+    """Salva uma configuração inteira.
+
+    Compatibilidade:
+    - `team_capacity` também grava em `capacidade_colaboradores` (chave antiga).
+    """
+    u = user or _cfg_user_fallback()
+    try:
+        iv = int(value)
+    except Exception:
+        iv = 0
+    set_config_value(key, str(iv), user=u)
+    if key == "team_capacity":
+        set_config_value("capacidade_colaboradores", str(iv), user=u)
 
 def get_team_capacity(default: int = 12) -> int:
-    v = get_config_value('capacidade_colaboradores', str(default))
-    try:
-        n = int(float(str(v).strip()))
-        return max(1, n)
-    except Exception:
-        return default
+    n = config_get_int("team_capacity", default)
+    return max(1, int(n) if isinstance(n, int) else default)
 
 def _norm_status(s: str) -> str:
     s = str(s or "").strip().lower()
