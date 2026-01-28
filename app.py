@@ -194,6 +194,7 @@ def render_concretagens_cards(df: "pd.DataFrame", title: str = ""):
         vol = fmt_compact_num(r.get("volume_m3",""))
         fck = fmt_compact_num(r.get("fck_mpa",""))
         slump = fmt_compact_num(r.get("slump_mm",""))
+        tipo_servico = str(r.get("tipo_servico","") or r.get("servico","") or "").strip() or "Concretagem"
         if tipo_servico and str(tipo_servico).strip() != "Concretagem":
             vol = "-"
             fck = "-"
@@ -206,7 +207,6 @@ def render_concretagens_cards(df: "pd.DataFrame", title: str = ""):
         tipo_serv = str(r.get("tipo_servico","") or "").strip()
         formas = r.get("formas_est","")
         formas_txt = fmt_compact_num(formas, 0) if str(formas or "").strip() != "" else ""
-        tipo_servico = str(r.get("tipo_servico","") or "").strip() or "Concretagem"
         try:
             formas = int(float(r.get("formas_est") or 0))
         except Exception:
