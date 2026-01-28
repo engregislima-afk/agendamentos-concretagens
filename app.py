@@ -1686,7 +1686,9 @@ except Exception:
 
 if menu == "Dashboard":
     st.markdown("## 📅 Agenda por dia")
-    sel_date = st.date_input("Data", value=date.today(), format="DD/MM/YYYY", key=uniq_key("dash_date"))
+    if "dash_date" not in st.session_state:
+        st.session_state["dash_date"] = date.today()
+    sel_date = st.date_input("Data", format="DD/MM/YYYY", key="dash_date")
     st.caption("Selecione a data para ver o resumo e os agendamentos desse dia.")
     df_next = get_concretagens_df(sel_date, sel_date)
 
@@ -1700,24 +1702,24 @@ if menu == "Dashboard":
                     "Status",
                     STATUS,
                     default=["Agendado","Aguardando","Confirmado","Execucao"],
-                    key=uniq_key("dash_status")
+                    key="dash_status"
                 )
             with c2:
                 obras_list = sorted([o for o in df_next["obra"].dropna().unique().tolist() if str(o).strip()])
-                f_obras = st.multiselect("Obras", obras_list, default=[], key=uniq_key("dash_obras"))
+                f_obras = st.multiselect("Obras", obras_list, default=[], key="dash_obras")
             with c3:
                 cidades = sorted([c for c in df_next.get("cidade", pd.Series([], dtype=str)).dropna().unique().tolist() if str(c).strip()])
-                f_cidades = st.multiselect("Cidades", cidades, default=[], key=uniq_key("dash_cidades"))
+                f_cidades = st.multiselect("Cidades", cidades, default=[], key="dash_cidades")
 
             c4, c5, c6 = st.columns([2,2,2])
             with c4:
                 equipes = sorted([e for e in df_next.get("equipe", pd.Series([], dtype=str)).dropna().unique().tolist() if str(e).strip()])
-                f_equipes = st.multiselect("Equipe", equipes, default=[], key=uniq_key("dash_equipes"))
+                f_equipes = st.multiselect("Equipe", equipes, default=[], key="dash_equipes")
             with c5:
                 usinas = sorted([u for u in df_next.get("usina", pd.Series([], dtype=str)).dropna().unique().tolist() if str(u).strip()])
-                f_usinas = st.multiselect("Usina/Fornecedor", usinas, default=[], key=uniq_key("dash_usinas"))
+                f_usinas = st.multiselect("Usina/Fornecedor", usinas, default=[], key="dash_usinas")
             with c6:
-                modo = st.radio("Visualização", ["Cards (recomendado)", "Tabela"], horizontal=True, index=0, key=uniq_key("dash_mode"))
+                modo = st.radio("Visualização", ["Cards (recomendado)", "Tabela"], horizontal=True, index=0, key="dash_mode")
 
         show = df_next.copy()
         if f_status:
@@ -1760,7 +1762,7 @@ if menu == "Dashboard":
                 file_name=f"concretagens_7dias_{today_local().isoformat()}.csv",
                 mime="text/csv",
                 use_container_width=True,
-                key=uniq_key("dash_csv"),
+                key="dash_csv",
             )
             xbytes = make_excel_bytes(exp, sheet_name="7_dias")
             st.download_button(
@@ -1769,7 +1771,7 @@ if menu == "Dashboard":
                 file_name=f"concretagens_7dias_{today_local().isoformat()}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
-                key=uniq_key("dash_xlsx"),
+                key="dash_xlsx",
             )
             pbytes = make_pdf_bytes(exp, titulo="Agendamentos — Dia selecionado")
             if pbytes:
@@ -1779,7 +1781,7 @@ if menu == "Dashboard":
                     file_name=f"concretagens_7dias_{today_local().isoformat()}.pdf",
                     mime="application/pdf",
                     use_container_width=True,
-                    key=uniq_key("dash_pdf"),
+                    key="dash_pdf",
                 )
 
         st.divider()
