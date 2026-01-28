@@ -2191,7 +2191,7 @@ elif menu == "Agenda (lista)":
             new_tipo_servico = st.selectbox("Tipo de serviço", TIPOS_SERVICO, index=idx_tipo, key=uniq_key("agenda_edit_tipo"))
 
             with c2:
-                new_dur = st.number_input("Duração (min)", min_value=15, value=int(row.get("duracao_min") or 60), step=5)
+                new_dur = st.number_input("Duração (min)", min_value=15, value=_safe_int(row.get("duracao_min"), 60), step=5)
 
             c3, c4 = st.columns(2)
             with c3:
@@ -2219,7 +2219,7 @@ elif menu == "Agenda (lista)":
 
             c11, c12 = st.columns(2)
             with c11:
-                new_cps_por_cam = st.number_input("Corpos de prova por caminhão (séries)", min_value=1, max_value=10, value=int(row.get("cps_por_caminhao") or 6), step=1)
+                new_cps_por_cam = st.number_input("Corpos de prova por caminhão (séries)", min_value=1, max_value=10, value=_safe_int(row.get("cps_por_caminhao"), 6), step=1)
             with c12:
                 if new_tipo_servico == "Concretagem":
                     new_caminhoes_est = calc_trucks(new_volume, new_cap)
