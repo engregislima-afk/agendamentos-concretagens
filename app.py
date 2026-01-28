@@ -171,16 +171,16 @@ def status_class(status: str) -> str:
     return "hab-badge-slate"
 
 def render_concretagens_cards(df: "pd.DataFrame", title: str = ""):
-    """Renderiza 'próximas concretagens' em cards (sem scroll horizontal)."""
+    """Renderiza próximos agendamentos em cards (sem scroll horizontal)."""
     if df is None or df.empty:
-        st.info("Nenhuma concretagem encontrada para este período/filtro.")
+        st.info("Nenhum agendamento encontrado para este período/filtro.")
         return
 
     if title:
         st.markdown(f"### {title}")
 
     # manter uma ordem amigável
-    cols_pref = ["data","hora_inicio","obra","cliente","cidade","volume_m3","fck_mpa","slump_mm","usina","bomba","equipe","status","observacoes"]
+    cols_pref = ["data","hora_inicio","obra","cliente","cidade","tipo_servico","volume_m3","caminhoes_est","formas_est","fck_mpa","slump_mm","usina","bomba","equipe","status","observacoes"]
     for c in cols_pref:
         if c not in df.columns:
             df[c] = ""
@@ -194,16 +194,29 @@ def render_concretagens_cards(df: "pd.DataFrame", title: str = ""):
         vol = fmt_compact_num(r.get("volume_m3",""))
         fck = fmt_compact_num(r.get("fck_mpa",""))
         slump = fmt_compact_num(r.get("slump_mm",""))
+        if tipo_servico and str(tipo_servico).strip() != "Concretagem":
+            vol = "-"
+            fck = "-"
+            slump = "-"
         usina = str(r.get("usina","") or "").strip()
         bomba = str(r.get("bomba","") or "").strip()
         equipe = str(r.get("equipe","") or "").strip()
         status = str(r.get("status","") or "").strip() or "-"
         obs = str(r.get("observacoes","") or "").strip()
+        tipo_servico = str(r.get("tipo_servico","") or "").strip() or "Concretagem"
+        try:
+            formas = int(float(r.get("formas_est") or 0))
+        except Exception:
+            formas = 0
+        try:
+            cam = int(float(r.get("caminhoes_est") or 0))
+        except Exception:
+            cam = 0
 
         badge_cls = status_class(status)
 
         # linhas auxiliares
-        sub_left = " • ".join([x for x in [cliente, cidade] if x])
+        sub_left = " • ".join([x for x in [cliente, cidade, (tipo_servico if tipo_servico and tipo_servico!="Concretagem" else "")] if x])
         sup = " | ".join([x for x in [("Usina: "+usina) if usina else "", ("Bomba: "+bomba) if bomba else "", ("Equipe: "+equipe) if equipe else ""] if x])
 
         st.markdown(
@@ -223,12 +236,12 @@ def render_concretagens_cards(df: "pd.DataFrame", title: str = ""):
                 <div><span class="hab-k">Slump</span><span class="hab-v">{slump} mm</span></div>
                 <div><span class="hab-k">Operação</span><span class="hab-v">{sup if sup else "-"}</span></div>
               </div>
+              {f'<div class="hab-row-obs">🧪 Formas (cota): <b>{formas}</b>{(" • Caminhões: <b>"+str(cam)+"</b>") if cam else ""}</div>' if (tipo_servico=="Concretagem" and (formas or cam)) else ''}
               {f'<div class="hab-row-obs">📝 {obs}</div>' if obs else ''}
             </div>
             """,
             unsafe_allow_html=True,
         )
-
 
 def parse_number(s, default=None):
     """Parse first number from text (accepts comma as decimal). Returns float or default."""
@@ -331,6 +344,12 @@ concretagens = Table(
     Column("bomba", String(200), nullable=True),
     Column("equipe", String(200), nullable=True),
         Column("colab_qtd", Integer, nullable=True),
+    Column("tipo_servico", String(120), nullable=True),
+
+    Column("cap_caminhao_m3", Float, nullable=True),
+    Column("cps_por_caminhao", Integer, nullable=True),
+    Column("caminhoes_est", Integer, nullable=True),
+    Column("formas_est", Integer, nullable=True),
 
     Column("status", String(40), nullable=True),
 
@@ -1102,6 +1121,8 @@ def migrate_schema(eng):
                     conn.execute(text(f"ALTER TABLE concretagens ADD COLUMN {ddl}"))
 
             add_col("slump_txt", "slump_txt TEXT")
+            add_col("tipo_servico", "tipo_servico TEXT")
+            add_col("tipo_servico", "tipo_servico TEXT")
             add_col("colab_qtd", "colab_qtd INTEGER DEFAULT 1")
             add_col("cap_caminhao_m3", "cap_caminhao_m3 REAL")
             add_col("cps_por_caminhao", "cps_por_caminhao INTEGER DEFAULT 4")
@@ -1483,6 +1504,7 @@ def get_concretagens_df(range_start, range_end) -> pd.DataFrame:
             o.telefone    AS telefone,
             c.data,
             c.hora_inicio,
+            c.tipo_servico,
             c.duracao_min,
             c.volume_m3,
             c.usina,
@@ -1521,10 +1543,10 @@ def get_concretagens_df(range_start, range_end) -> pd.DataFrame:
     if df.empty:
         # garante colunas para não quebrar telas (ex.: dashboard) quando não há registros
         return pd.DataFrame(columns=[
-            'id','obra_id','data','hora_inicio','duracao_min','volume_m3','fck_mpa','slump_mm',
-            'usina','bomba','equipe','status','observacoes',
-            'criado_por','alterado_por','atualizado_em','created_at',
-            'obra','cliente','cidade','responsavel','telefone','cnpj'
+            "id","obra_id","obra","endereco","cliente","cidade","data","hora_inicio","hora_fim","duracao_min",
+            "tipo_servico","volume_m3","fck_mpa","slump_mm","bombeado","usina","bomba","equipe","colab_qtd","status",
+            "cap_caminhao_m3","cps_por_caminhao","caminhoes_est","formas_est",
+            "created_at","created_by","updated_at","updated_by","observacoes"
         ])
 
     for col in ("duracao_min", "volume_m3", "fck_mpa", "slump_mm"):
@@ -1905,7 +1927,7 @@ except Exception:
 
 
 if menu == "Dashboard":
-    st.markdown("## 📌 Próximas concretagens (7 dias)")
+    st.markdown("## 📌 Próximos serviços (7 dias)")
     df_next = get_next_concretagens_df(7)
 
     if df_next.empty:
@@ -1953,20 +1975,24 @@ if menu == "Dashboard":
         # -------------------- KPIs --------------------
         total = int(len(show))
         total_m3 = float(show["volume_m3"].fillna(0).sum()) if "volume_m3" in show.columns else 0.0
+        total_formas = int(show["formas_est"].fillna(0).sum()) if "formas_est" in show.columns else 0
         qtd_hoje = int((show["data"] == today_local().isoformat()).sum()) if "data" in show.columns else 0
 
         conflicts = detect_schedule_conflicts(show)
         qtd_conf = len(conflicts)
 
-        k1, k2, k3, k4 = st.columns([1.1,1.1,1.1,1.1])
+        k1, k2, k3, k4, k5 = st.columns([1.1,1.1,1.1,1.1,1.1])
         with k1:
-            st.metric("Concretagens", f"{total}")
+            st.metric("Agendamentos", f"{total}")
         with k2:
             st.metric("Volume total", f"{fmt_compact_num(total_m3)} m³")
         with k3:
             st.metric("Hoje", f"{qtd_hoje}")
         with k4:
             st.metric("Conflitos", f"{qtd_conf}")
+        with k5:
+            st.metric("Formas (cota)", f"{total_formas}")
+
 
         # -------------------- Alertas rápidos --------------------
         missing_eq = int((show.get("equipe","").fillna("").astype(str).str.strip() == "").sum()) if "equipe" in show.columns else 0
@@ -2363,7 +2389,7 @@ elif menu == "Agenda (calendário)":
                         st.caption(f"Status: {status}")
 
 elif menu == "Novo agendamento":
-    st.subheader("🧱 Novo agendamento de concretagem")
+    st.subheader("🗓️ Novo agendamento")
 
     df_obras = get_obras_df()
     if df_obras.empty:
@@ -2375,6 +2401,12 @@ elif menu == "Novo agendamento":
         st.markdown('<div class="hab-card">', unsafe_allow_html=True)
         with st.form("form_conc_new"):
             obra_sel = st.selectbox("Obra *", labels)
+            tipo_servico = st.selectbox(
+                "Tipo de serviço *",
+                ["Concretagem", "Ensaio de solo", "Coleta de solo", "Arrancamento", "Coleta de blocos e prismas"],
+                index=0
+            )
+
 
             cA, cB = st.columns(2)
             with cA:
@@ -2382,17 +2414,43 @@ elif menu == "Novo agendamento":
             with cB:
                 h = st.time_input("Hora início *", value=time(8, 0))
 
-            cC, cD = st.columns(2)
-            with cC:
-                volume = st.number_input("Volume (m³) *", min_value=0.0, value=30.0, step=1.0)
-            with cD:
-                dur = st.number_input("Duração prevista (min)", min_value=15, value=default_duration_min(30.0), step=5)
+            if tipo_servico == "Concretagem":
+                cC, cD = st.columns(2)
+                with cC:
+                    volume = st.number_input("Volume (m³) *", min_value=0.0, value=30.0, step=0.5)
+                with cD:
+                    dur = st.number_input("Duração prevista (min) *", min_value=15, value=default_duration_min(30.0), step=5)
 
-            cE, cF = st.columns(2)
-            with cE:
-                fck = st.number_input("FCK (MPa)", min_value=0.0, value=25.0, step=1.0)
-            with cF:
-                slump = st.text_input("Abatimento / Slump", value="100±20 mm")
+                cE, cF, cG = st.columns(3)
+                with cE:
+                    fck = st.number_input("FCK (MPa)", min_value=0, value=25, step=1)
+                with cF:
+                    slump = st.text_input("Slump (cm)", value="")
+                with cG:
+                    bombeado = st.checkbox("Bombeado?", value=False)
+
+                st.markdown("**📌 Cota de rupturas (estimativa)**")
+                cH, cI = st.columns(2)
+                with cH:
+                    cap = st.number_input("Capacidade caminhão (m³) *", min_value=0.1, value=8.0, step=0.1)
+                with cI:
+                    cps_por_cam = st.number_input("Corpos de prova por caminhão *", min_value=1, value=6, step=1)
+
+                caminhaos_est = calc_trucks(volume, cap)
+                formas_est = calc_cp_qty(caminhaos_est, cps_por_cam)
+                st.caption(f"Estimativa: **{caminhaos_est} caminhão(ões)** → **{formas_est} CPs/forma(s)**")
+
+            else:
+                volume = 0.0
+                fck = None
+                slump = ""
+                bombeado = False
+                dur = st.number_input("Duração prevista (min) *", min_value=15, value=60, step=5)
+                cap = None
+                cps_por_cam = None
+                caminhaos_est = 0
+                formas_est = 0
+                st.caption("Estimativas de caminhões/CPs aplicam-se somente para Concretagem.")
 
             usina = st.text_input("Usina / Fornecedor", value="")
             bomba = st.text_input("Bomba (ID/placa/empresa)", value="")
@@ -2400,11 +2458,6 @@ elif menu == "Novo agendamento":
             colab_qtd = st.number_input("Colaboradores na obra (qtd)", min_value=1, step=1, value=1)
             status = st.selectbox("Status", STATUS, index=STATUS.index("Agendado"))
             obs = st.text_area("Observações", value="")
-            cap = st.number_input("Capacidade caminhão (m³) p/ estimativa", min_value=1.0, max_value=30.0, value=8.0, step=0.5)
-            cps_por_cam = st.number_input("Corpos de prova por caminhão (séries)", min_value=1, max_value=10, value=4, step=1)
-            caminhaos_est = calc_trucks(float(volume or 0.0), float(cap or 8.0))
-            formas_est = int(caminhaos_est) * int(cps_por_cam or 0)
-            st.caption(f"Estimativa: **{caminhaos_est} caminhões** (cap. {fmt_compact_num(cap)} m³) • **{formas_est} formas** (CP/caminhão: {int(cps_por_cam)})")
             # alerta de capacidade (não bloqueia)
             _cap_total = get_team_capacity(12)
             _committed = get_committed_collaborators(d.strftime("%Y-%m-%d"))
@@ -2429,6 +2482,7 @@ elif menu == "Novo agendamento":
 
                 new_id = exec_stmt(insert(concretagens).values(
                     obra_id=obra_id,
+                    tipo_servico=(tipo_servico or None),
                     data=data_str,
                     hora_inicio=hora_str,
                     duracao_min=int(dur),
@@ -2436,6 +2490,10 @@ elif menu == "Novo agendamento":
                     fck_mpa=float(fck) if fck else None,
                     slump_mm=parse_number(slump, None),
                     slump_txt=(slump.strip() if slump else None),
+                    cap_caminhao_m3=(float(cap) if cap else None),
+                    cps_por_caminhao=(int(cps_por_cam) if cps_por_cam else None),
+                    caminhoes_est=(int(caminhaos_est) if caminhaos_est else None),
+                    formas_est=(int(formas_est) if formas_est else None),
                     usina=(usina or "").strip(),
                     bomba=(bomba or "").strip(),
                     equipe=(equipe or "").strip(),
@@ -2489,8 +2547,10 @@ elif menu == "Agenda (lista)":
             df = df[mask]
 
         view_cols = [
-            "id","data","hora_inicio","duracao_min","obra","cliente","cidade",
-            "volume_m3","fck_mpa","slump_mm","usina","bomba","equipe","status",
+            "id","data","hora_inicio","hora_fim","duracao_min","tipo_servico",
+            "obra","cliente","cidade","endereco",
+            "volume_m3","caminhoes_est","formas_est","fck_mpa","slump_mm","bombeado",
+            "cap_caminhao_m3","cps_por_caminhao","usina","bomba","equipe","colab_qtd","status",
             "criado_por","alterado_por","atualizado_em","observacoes"
         ]
         view = df[view_cols].copy()
@@ -2518,6 +2578,14 @@ elif menu == "Agenda (lista)":
             c1, c2 = st.columns(2)
             with c1:
                 new_status = st.selectbox("Status", STATUS, index=STATUS.index(row["status"]))
+            TIPOS_SERVICO = ["Concretagem", "Ensaio de solo", "Coleta de solo", "Arrancamento", "Coleta de blocos e prismas"]
+            cur_tipo = (row.get("tipo_servico") or "Concretagem")
+            try:
+                idx_tipo = TIPOS_SERVICO.index(cur_tipo)
+            except Exception:
+                idx_tipo = 0
+            new_tipo_servico = st.selectbox("Tipo de serviço", TIPOS_SERVICO, index=idx_tipo, key=uniq_key("agenda_edit_tipo"))
+
             with c2:
                 new_dur = st.number_input("Duração (min)", min_value=15, value=int(row["duracao_min"]), step=5)
 
@@ -2549,9 +2617,14 @@ elif menu == "Agenda (lista)":
             with c11:
                 new_cps_por_cam = st.number_input("Corpos de prova por caminhão (séries)", min_value=1, max_value=10, value=int(row.get("cps_por_caminhao") or 4), step=1)
             with c12:
-                new_caminhoes_est = calc_trucks(float(new_volume or 0.0), float(new_cap or 8.0))
-                new_formas_est = int(new_caminhoes_est) * int(new_cps_por_cam or 0)
-                st.caption(f"Estimativa: **{new_caminhoes_est} caminhões** (cap. {fmt_compact_num(new_cap)} m³) • **{new_formas_est} formas** (CP/caminhão: {int(new_cps_por_cam)})")
+                if new_tipo_servico == "Concretagem":
+                    new_caminhoes_est = calc_trucks(new_volume, new_cap)
+                    new_formas_est = calc_cp_qty(new_caminhoes_est, new_cps)
+                    st.caption(f"Estimativa: **{new_caminhoes_est} caminhão(ões)** → **{new_formas_est} CPs/forma(s)**")
+                else:
+                    new_caminhoes_est = 0
+                    new_formas_est = 0
+                    st.caption("Estimativas de caminhões/CPs aplicam-se somente para Concretagem.")
 
             _cap_total_edit = get_team_capacity(12)
             _committed_edit = get_committed_collaborators(str(row.get("data") or ""))
@@ -2587,6 +2660,11 @@ elif menu == "Agenda (lista)":
                         slump_mm=parse_number(new_slump, None),
                         slump_txt=(new_slump.strip() if new_slump else None),
                         volume_m3=float(new_volume),
+                        tipo_servico=(new_tipo_servico or None),
+                        cap_caminhao_m3=float(new_cap) if new_cap else None,
+                        cps_por_caminhao=int(new_cps) if new_cps else None,
+                        caminhoes_est=int(new_caminhoes_est),
+                        formas_est=int(new_formas_est),
                         fck_mpa=float(new_fck) if new_fck else None,
                         observacoes=(new_obs or "").strip(),
                         atualizado_em=now,
@@ -2598,6 +2676,19 @@ elif menu == "Agenda (lista)":
 
                 st.success("Atualizado ✅")
                 st.rerun()
+
+        st.markdown("---")
+        with st.expander("🗑️ Excluir agendamento", expanded=False):
+            st.warning("A exclusão é permanente e remove o agendamento da agenda e do histórico.")
+            confirm_del = st.text_input("Digite EXCLUIR para confirmar", value="", key=uniq_key(f"del_confirm_{row['id']}"))
+            can_del = (confirm_del.strip().upper() == "EXCLUIR")
+            if st.button("Excluir agendamento", key=uniq_key(f"del_btn_{row['id']}"), disabled=not can_del):
+                try:
+                    delete_concretagem_by_id(int(row["id"]), current_user())
+                    st.success("Agendamento excluído.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Falha ao excluir: {e}")
 
 # ============================
 # Histórico
