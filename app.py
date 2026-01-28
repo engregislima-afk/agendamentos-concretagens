@@ -1201,10 +1201,42 @@ def fetch_cnpj_data(cnpj: str):
 # Calculations
 # =============================================================================
 
+def _safe_float(x, default: float = 0.0) -> float:
+    try:
+        v = float(x)
+        return v if math.isfinite(v) else float(default)
+    except Exception:
+        return float(default)
+
+def _safe_int(x, default: int = 0) -> int:
+    try:
+        # aceita string/float e trata NaN
+        v = float(x)
+        if not math.isfinite(v):
+            return int(default)
+        return int(v)
+    except Exception:
+        return int(default)
+
 def calc_trucks(volume_m3: float, capacidade_m3: float = 8.0) -> int:
-    if volume_m3 <= 0 or capacidade_m3 <= 0:
+    """Estimativa de caminhões.
+
+    Robustez: trata None/strings/NaN/inf e evita ValueError em math.ceil(NaN).
+    """
+    try:
+        v = float(volume_m3) if volume_m3 is not None else 0.0
+    except Exception:
+        v = 0.0
+    try:
+        c = float(capacidade_m3) if capacidade_m3 is not None else 0.0
+    except Exception:
+        c = 0.0
+
+    if not math.isfinite(v) or not math.isfinite(c):
         return 0
-    return int(math.ceil(volume_m3 / capacidade_m3))
+    if v <= 0 or c <= 0:
+        return 0
+    return int(math.ceil(v / c))
 
 def calc_cp_qty(caminhoes_est: int, cps_por_caminhao: int) -> int:
     try:
@@ -2175,15 +2207,15 @@ elif menu == "Agenda (lista)":
 
             c7, c8 = st.columns(2)
             with c7:
-                new_volume = st.number_input("Volume (m³)", min_value=0.0, value=float(row.get("volume_m3") or 0.0), step=1.0)
+                new_volume = st.number_input("Volume (m³)", min_value=0.0, value=_safe_float(row.get("volume_m3"), 0.0), step=1.0)
             with c8:
-                new_fck = st.number_input("FCK (MPa)", min_value=0.0, value=float(row.get("fck_mpa") or 0.0), step=1.0)
+                new_fck = st.number_input("FCK (MPa)", min_value=0.0, value=_safe_float(row.get("fck_mpa"), 0.0), step=1.0)
 
             c9, c10 = st.columns(2)
             with c9:
-                new_colab_qtd = st.number_input("Colaboradores na obra (qtd)", min_value=1, step=1, value=int(row.get("colab_qtd") or 1))
+                new_colab_qtd = st.number_input("Colaboradores na obra (qtd)", min_value=1, step=1, value=_safe_int(row.get("colab_qtd"), 1))
             with c10:
-                new_cap = st.number_input("Capacidade caminhão (m³) p/ estimativa", min_value=1.0, max_value=30.0, value=float(row.get("cap_caminhao_m3") or 8.0), step=0.5)
+                new_cap = st.number_input("Capacidade caminhão (m³) p/ estimativa", min_value=1.0, max_value=30.0, value=_safe_float(row.get("cap_caminhao_m3"), 8.0), step=0.5)
 
             c11, c12 = st.columns(2)
             with c11:
