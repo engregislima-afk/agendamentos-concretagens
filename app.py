@@ -1126,50 +1126,79 @@ def migrate_schema(eng):
                     pass
 
 def migrate_schema(eng):
-    """Pequenas migrações incrementais (SQLite/Postgres).
-    Mantém compatibilidade com DBs já existentes."""
+    """Best-effort schema migration (SQLite/Postgres) to keep old DBs compatible with the current code."""
+    from sqlalchemy import text
+
+    dialect = eng.dialect.name
+
+    # (table, col, ddl_sqlite, ddl_pg)
+    cols = [
+        # obras
+        ("obras", "ativo", "INTEGER DEFAULT 1", "BOOLEAN DEFAULT TRUE"),
+        ("obras", "created_at", "TIMESTAMP", "TIMESTAMP"),
+        ("obras", "updated_at", "TIMESTAMP", "TIMESTAMP"),
+
+        # colaboradores
+        ("colaboradores", "ativo", "INTEGER DEFAULT 1", "BOOLEAN DEFAULT TRUE"),
+        ("colaboradores", "created_at", "TIMESTAMP", "TIMESTAMP"),
+        ("colaboradores", "updated_at", "TIMESTAMP", "TIMESTAMP"),
+
+        # usuarios
+        ("usuarios", "ativo", "INTEGER DEFAULT 1", "BOOLEAN DEFAULT TRUE"),
+        ("usuarios", "perfil", "TEXT", "TEXT"),
+        ("usuarios", "created_at", "TIMESTAMP", "TIMESTAMP"),
+        ("usuarios", "updated_at", "TIMESTAMP", "TIMESTAMP"),
+
+        # settings/config
+        ("settings", "key", "TEXT", "TEXT"),
+        ("settings", "value", "TEXT", "TEXT"),
+        ("settings", "updated_at", "TIMESTAMP", "TIMESTAMP"),
+
+        # concretagens (agendamentos)
+        ("concretagens", "tipo_servico", "TEXT DEFAULT 'Concretagem'", "TEXT DEFAULT 'Concretagem'"),
+        ("concretagens", "volume_m3", "REAL", "DOUBLE PRECISION"),
+        ("concretagens", "duracao_min", "INTEGER", "INTEGER"),
+        ("concretagens", "fck_mpa", "REAL", "DOUBLE PRECISION"),
+        ("concretagens", "slump_mm", "INTEGER", "INTEGER"),
+        ("concretagens", "slump_txt", "TEXT", "TEXT"),
+        ("concretagens", "bomba", "TEXT", "TEXT"),
+        ("concretagens", "fornecedor", "TEXT", "TEXT"),
+
+        ("concretagens", "cap_caminhao_m3", "REAL DEFAULT 8.0", "DOUBLE PRECISION DEFAULT 8.0"),
+        ("concretagens", "cps_por_caminhao", "INTEGER DEFAULT 6", "INTEGER DEFAULT 6"),
+        ("concretagens", "caminhoes_est", "INTEGER DEFAULT 0", "INTEGER DEFAULT 0"),
+        ("concretagens", "formas_est", "INTEGER DEFAULT 0", "INTEGER DEFAULT 0"),
+
+        ("concretagens", "created_at", "TIMESTAMP", "TIMESTAMP"),
+        ("concretagens", "updated_at", "TIMESTAMP", "TIMESTAMP"),
+        ("concretagens", "criado_por", "TEXT", "TEXT"),
+        ("concretagens", "atualizado_por", "TEXT", "TEXT"),
+    ]
+
     with eng.begin() as conn:
-        if eng.dialect.name == "sqlite":
-            # listar colunas existentes
-            cols = [r[1] for r in conn.execute(text("PRAGMA table_info(concretagens)")).fetchall()]
+        if dialect == "sqlite":
+            def col_exists(table: str, col: str) -> bool:
+                try:
+                    res = conn.execute(text(f"PRAGMA table_info({table});")).fetchall()
+                    return any(r[1] == col for r in res)
+                except Exception:
+                    return False
 
-            def add_col(name: str, ddl: str):
-                if name not in cols:
-                    conn.execute(text(f"ALTER TABLE concretagens ADD COLUMN {ddl}"))
+            def add_col(table: str, col: str, ddl: str):
+                if not col_exists(table, col):
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {ddl};"))
 
-            add_col("slump_txt", "slump_txt TEXT")
-            add_col("tipo_servico", "tipo_servico TEXT")
-            add_col("tipo_servico", "tipo_servico TEXT")
-            add_col("colab_qtd", "colab_qtd INTEGER DEFAULT 1")
-            add_col("cap_caminhao_m3", "cap_caminhao_m3 REAL")
-            add_col("cps_por_caminhao", "cps_por_caminhao INTEGER DEFAULT 4")
-            add_col("caminhoes_est", "caminhoes_est INTEGER")
-            add_col("formas_est", "formas_est INTEGER")
+            for table, col, ddl_sqlite, _ddl_pg in cols:
+                add_col(table, col, ddl_sqlite)
 
-        elif eng.dialect.name in ("postgresql", "postgres"):
-            # Postgres: checar colunas via information_schema
-            existing = {
-                r[0]
-                for r in conn.execute(text("""
-                    SELECT column_name
-                    FROM information_schema.columns
-                    WHERE table_name='concretagens'
-                """)).fetchall()
-            }
+        elif dialect in ("postgresql", "postgres"):
+            def add_col_pg(table: str, col: str, ddl: str):
+                # Works on Postgres 9.6+ (ADD COLUMN IF NOT EXISTS)
+                conn.execute(text(f'ALTER TABLE "{table}" ADD COLUMN IF NOT EXISTS "{col}" {ddl};'))
 
-            def add_col(name: str, ddl: str):
-                if name not in existing:
-                    conn.execute(text(f"ALTER TABLE concretagens ADD COLUMN {ddl}"))
+            for table, col, _ddl_sqlite, ddl_pg in cols:
+                add_col_pg(table, col, ddl_pg)
 
-            add_col("slump_txt", "slump_txt TEXT")
-            add_col("tipo_servico", "tipo_servico TEXT")
-            add_col("colab_qtd", "colab_qtd INTEGER DEFAULT 1")
-            add_col("cap_caminhao_m3", "cap_caminhao_m3 DOUBLE PRECISION")
-            add_col("cps_por_caminhao", "cps_por_caminhao INTEGER DEFAULT 4")
-            add_col("caminhoes_est", "caminhoes_est INTEGER")
-            add_col("formas_est", "formas_est INTEGER")
-
-        # config table will be created by metadata.create_all() if missing.
 def init_db():
     eng = get_engine()
     # Testa conexão antes de tentar criar tabelas (evita crash "mudo" no Cloud)
@@ -1489,8 +1518,21 @@ def fetch_cnpj_data(cnpj: str):
 def calc_trucks(volume_m3: float, capacidade_m3: float = 8.0) -> int:
     if volume_m3 <= 0:
         return 0
+    if capacidade_m3 <= 0:
+        return 0
     import math
     return int(math.ceil(volume_m3 / capacidade_m3))
+
+def calc_cp_qty(caminhoes_est: int, cps_por_caminhao: int) -> int:
+    """Estimativa de formas / corpos de prova totais = caminhões * CPs por caminhão."""
+    try:
+        c = int(caminhoes_est) if caminhoes_est is not None else 0
+        p = int(cps_por_caminhao) if cps_por_caminhao is not None else 0
+    except Exception:
+        return 0
+    if c <= 0 or p <= 0:
+        return 0
+    return c * p
 
 def default_duration_min(volume_m3: float) -> int:
     trucks = calc_trucks(volume_m3, 8.0)
