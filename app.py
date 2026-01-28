@@ -2230,6 +2230,58 @@ elif menu == "Agenda (lista)":
             with c2:
                 new_dur = st.number_input("Duração (min)", min_value=15, value=int(row.get("duracao_min") or 60), step=5)
 
+
+            # Campos de data/horário e recursos (colaboradores/caminhão/CPs) — editável
+            _raw_data = row.get("data") if hasattr(row, "get") else None
+            try:
+                _d0 = pd.to_datetime(_raw_data).date() if _raw_data else today_local().date()
+            except Exception:
+                _d0 = today_local().date()
+
+            _raw_hora = (row.get("hora_inicio") if hasattr(row, "get") else None) or (row.get("hora") if hasattr(row, "get") else None)
+            try:
+                _h0 = pd.to_datetime(_raw_hora).time() if _raw_hora else datetime.now().time().replace(second=0, microsecond=0)
+            except Exception:
+                _h0 = datetime.now().time().replace(second=0, microsecond=0)
+
+            cd1, cd2 = st.columns(2)
+            with cd1:
+                new_data = st.date_input("Data", value=_d0, key=f"edit_data_{sel_id}")
+            with cd2:
+                new_hora = st.time_input("Hora", value=_h0, key=f"edit_hora_{sel_id}")
+
+            # defaults robustos para evitar NaN/None quebrando int()/float()
+            _raw_colab = row.get("colab_qtd") if hasattr(row, "get") else None
+            if _raw_colab is None or (isinstance(_raw_colab, float) and math.isnan(_raw_colab)):
+                _raw_colab = 0
+            try:
+                _colab0 = int(float(_raw_colab))
+            except Exception:
+                _colab0 = 0
+
+            _raw_cap = row.get("cap_caminhao_m3") if hasattr(row, "get") else None
+            if _raw_cap is None or (isinstance(_raw_cap, float) and math.isnan(_raw_cap)):
+                _raw_cap = 0.0
+            try:
+                _cap0 = float(_raw_cap)
+            except Exception:
+                _cap0 = 0.0
+
+            _raw_cps = row.get("cps_por_caminhao") if hasattr(row, "get") else None
+            if _raw_cps is None or (isinstance(_raw_cps, float) and math.isnan(_raw_cps)):
+                _raw_cps = 6
+            try:
+                _cps0 = int(float(_raw_cps))
+            except Exception:
+                _cps0 = 6
+
+            cr1, cr2, cr3 = st.columns(3)
+            with cr1:
+                new_colab_qtd = st.number_input("Colaboradores na obra (qtd)", min_value=0, max_value=100, value=_colab0, step=1, key=f"edit_colab_{sel_id}")
+            with cr2:
+                new_cap = st.number_input("Capacidade caminhão (m³) p/ estimativa", min_value=0.0, max_value=50.0, value=_cap0, step=0.5, key=f"edit_cap_{sel_id}")
+            with cr3:
+                new_cps_por_cam = st.number_input("Corpos de prova por caminhão (séries)", min_value=1, max_value=10, value=_cps0, step=1, key=f"edit_cps_{sel_id}")
             c3, c4 = st.columns(2)
             with c3:
                 new_bomba = st.text_input("Bomba", value=str(row.get("bomba") or ""))
@@ -2296,6 +2348,9 @@ elif menu == "Agenda (lista)":
                         slump_mm=parse_number(new_slump, None),
                         slump_txt=(new_slump.strip() if new_slump else None),
                         volume_m3=float(new_volume),
+                        data=new_data.isoformat(),
+                        hora_inicio=new_hora.strftime("%H:%M") if hasattr(new_hora, "strftime") else str(new_hora),
+                        colab_qtd=int(new_colab_qtd),
                         tipo_servico=(new_tipo_servico or None),
                         cap_caminhao_m3=float(new_cap) if new_cap else None,
                         # ✅ PATCH: new_cps -> new_cps_por_cam
@@ -2322,7 +2377,7 @@ elif menu == "Agenda (lista)":
             st.warning("A exclusão é permanente e remove o agendamento da agenda e do histórico.")
             confirm_del = st.text_input("Digite EXCLUIR para confirmar", value="", key=uniq_key(f"del_confirm_{row['id']}"))
             can_del = (confirm_del.strip().upper() == "EXCLUIR")
-            if st.button("Excluir agendamento", key=uniq_key(f"del_btn_{row['id']}"), disabled=not can_del):
+            if st.button("Excluir agendamento", key=f"del_btn_{row['id']}", disabled=not can_del):
                 try:
                     ok = delete_concretagem_by_id(int(row["id"]), current_user())
                     if ok:
