@@ -55,11 +55,18 @@ from sqlalchemy.engine import Engine
 # Streamlit helpers
 # =============================================================================
 
+# Gerador de keys estáveis (evita DuplicateElementKey sem quebrar cliques em botões)
+_UNIQ_KEY_COUNTS: dict[str, int] = {}
+
 def uniq_key(prefix: str = "k") -> str:
-    """Gera keys únicas por execução para evitar StreamlitDuplicateElementKey."""
-    n = st.session_state.get("_uniq_key_counter", 0) + 1
-    st.session_state["_uniq_key_counter"] = n
-    return f"{prefix}_{n}"
+    """Gera keys únicas por prefixo, mantendo estabilidade entre reruns.
+
+    - 1ª vez que o prefixo aparece no run -> retorna o próprio prefixo
+    - Repetições no mesmo run -> adiciona sufixo _N
+    """
+    n = _UNIQ_KEY_COUNTS.get(prefix, 0)
+    _UNIQ_KEY_COUNTS[prefix] = n + 1
+    return prefix if n == 0 else f"{prefix}_{n}"
 
 
 # =============================================================================
@@ -1201,39 +1208,35 @@ def fetch_cnpj_data(cnpj: str):
 # Calculations
 # =============================================================================
 
-def _safe_float(x, default: float = 0.0) -> float:
+def _is_nan(x) -> bool:
     try:
-        v = float(x)
-        return v if math.isfinite(v) else float(default)
+        return isinstance(x, float) and math.isnan(x)
     except Exception:
-        return float(default)
+        return False
 
-def _safe_int(x, default: int = 0) -> int:
+def _safe_int(x, default: int) -> int:
     try:
-        # aceita string/float e trata NaN
-        v = float(x)
-        if not math.isfinite(v):
-            return int(default)
-        return int(v)
+        if x is None or _is_nan(x):
+            return default
+        if isinstance(x, str) and not x.strip():
+            return default
+        return int(float(x))
     except Exception:
-        return int(default)
+        return default
+
+def _safe_float(x, default: float) -> float:
+    try:
+        if x is None or _is_nan(x):
+            return default
+        if isinstance(x, str) and not x.strip():
+            return default
+        return float(x)
+    except Exception:
+        return default
 
 def calc_trucks(volume_m3: float, capacidade_m3: float = 8.0) -> int:
-    """Estimativa de caminhões.
-
-    Robustez: trata None/strings/NaN/inf e evita ValueError em math.ceil(NaN).
-    """
-    try:
-        v = float(volume_m3) if volume_m3 is not None else 0.0
-    except Exception:
-        v = 0.0
-    try:
-        c = float(capacidade_m3) if capacidade_m3 is not None else 0.0
-    except Exception:
-        c = 0.0
-
-    if not math.isfinite(v) or not math.isfinite(c):
-        return 0
+    v = _safe_float(volume_m3, 0.0)
+    c = _safe_float(capacidade_m3, 0.0)
     if v <= 0 or c <= 0:
         return 0
     return int(math.ceil(v / c))
@@ -2191,7 +2194,7 @@ elif menu == "Agenda (lista)":
             new_tipo_servico = st.selectbox("Tipo de serviço", TIPOS_SERVICO, index=idx_tipo, key=uniq_key("agenda_edit_tipo"))
 
             with c2:
-                new_dur = st.number_input("Duração (min)", min_value=15, value=_safe_int(row.get("duracao_min"), 60), step=5)
+                new_dur = st.number_input("Duração (min)", min_value=15, value=int(row.get("duracao_min") or 60), step=5)
 
             c3, c4 = st.columns(2)
             with c3:
@@ -2207,15 +2210,15 @@ elif menu == "Agenda (lista)":
 
             c7, c8 = st.columns(2)
             with c7:
-                new_volume = st.number_input("Volume (m³)", min_value=0.0, value=_safe_float(row.get("volume_m3"), 0.0), step=1.0)
+                new_volume = st.number_input("Volume (m³)", min_value=0.0, value=float(row.get("volume_m3") or 0.0), step=1.0)
             with c8:
-                new_fck = st.number_input("FCK (MPa)", min_value=0.0, value=_safe_float(row.get("fck_mpa"), 0.0), step=1.0)
+                new_fck = st.number_input("FCK (MPa)", min_value=0.0, value=float(row.get("fck_mpa") or 0.0), step=1.0)
 
             c9, c10 = st.columns(2)
             with c9:
-                new_colab_qtd = st.number_input("Colaboradores na obra (qtd)", min_value=1, step=1, value=_safe_int(row.get("colab_qtd"), 1))
+                new_colab_qtd = st.number_input("Colaboradores na obra (qtd)", min_value=1, step=1, value=int(row.get("colab_qtd") or 1))
             with c10:
-                new_cap = st.number_input("Capacidade caminhão (m³) p/ estimativa", min_value=1.0, max_value=30.0, value=_safe_float(row.get("cap_caminhao_m3"), 8.0), step=0.5)
+                new_cap = st.number_input("Capacidade caminhão (m³) p/ estimativa", min_value=1.0, max_value=30.0, value=float(row.get("cap_caminhao_m3") or 8.0), step=0.5)
 
             c11, c12 = st.columns(2)
             with c11:
