@@ -55,18 +55,11 @@ from sqlalchemy.engine import Engine
 # Streamlit helpers
 # =============================================================================
 
-# Gerador de keys estáveis (evita DuplicateElementKey sem quebrar cliques em botões)
-_UNIQ_KEY_COUNTS: dict[str, int] = {}
-
 def uniq_key(prefix: str = "k") -> str:
-    """Gera keys únicas por prefixo, mantendo estabilidade entre reruns.
-
-    - 1ª vez que o prefixo aparece no run -> retorna o próprio prefixo
-    - Repetições no mesmo run -> adiciona sufixo _N
-    """
-    n = _UNIQ_KEY_COUNTS.get(prefix, 0)
-    _UNIQ_KEY_COUNTS[prefix] = n + 1
-    return prefix if n == 0 else f"{prefix}_{n}"
+    """Gera keys únicas por execução para evitar StreamlitDuplicateElementKey."""
+    n = st.session_state.get("_uniq_key_counter", 0) + 1
+    st.session_state["_uniq_key_counter"] = n
+    return f"{prefix}_{n}"
 
 
 # =============================================================================
@@ -1208,35 +1201,39 @@ def fetch_cnpj_data(cnpj: str):
 # Calculations
 # =============================================================================
 
-def _is_nan(x) -> bool:
+def _safe_float(x, default: float = 0.0) -> float:
     try:
-        return isinstance(x, float) and math.isnan(x)
+        v = float(x)
+        return v if math.isfinite(v) else float(default)
     except Exception:
-        return False
+        return float(default)
 
-def _safe_int(x, default: int) -> int:
+def _safe_int(x, default: int = 0) -> int:
     try:
-        if x is None or _is_nan(x):
-            return default
-        if isinstance(x, str) and not x.strip():
-            return default
-        return int(float(x))
+        # aceita string/float e trata NaN
+        v = float(x)
+        if not math.isfinite(v):
+            return int(default)
+        return int(v)
     except Exception:
-        return default
-
-def _safe_float(x, default: float) -> float:
-    try:
-        if x is None or _is_nan(x):
-            return default
-        if isinstance(x, str) and not x.strip():
-            return default
-        return float(x)
-    except Exception:
-        return default
+        return int(default)
 
 def calc_trucks(volume_m3: float, capacidade_m3: float = 8.0) -> int:
-    v = _safe_float(volume_m3, 0.0)
-    c = _safe_float(capacidade_m3, 0.0)
+    """Estimativa de caminhões.
+
+    Robustez: trata None/strings/NaN/inf e evita ValueError em math.ceil(NaN).
+    """
+    try:
+        v = float(volume_m3) if volume_m3 is not None else 0.0
+    except Exception:
+        v = 0.0
+    try:
+        c = float(capacidade_m3) if capacidade_m3 is not None else 0.0
+    except Exception:
+        c = 0.0
+
+    if not math.isfinite(v) or not math.isfinite(c):
+        return 0
     if v <= 0 or c <= 0:
         return 0
     return int(math.ceil(v / c))
@@ -1381,21 +1378,54 @@ def get_history_df(concretagem_id: int) -> pd.DataFrame:
         df["detalhes"] = df["detalhes"].apply(_safe_parse)
     return df
 
-def delete_concretagem_by_id(cid: int, user: str) -> None:
+def delete_concretagem_by_id(cid: int, user: str) -> bool:
+    """Tenta excluir um agendamento (hard delete).
+    Retorna True se excluir de fato; se não for possível (ex.: RLS/permissão),
+    tenta ao menos marcar como Cancelado e retorna False.
+    """
     cid = int(cid)
+
     before = get_concretagem_by_id(cid)
     if not before:
-        return
+        return True
+
     try:
         add_history(cid, "DELETE", before, None, user)
+        exec_stmt(delete(concretagens).where(concretagens.c.id == cid))
     except Exception:
-        pass
-    exec_stmt(delete(concretagens).where(concretagens.c.id == cid))
+        # fallback: marcar como cancelado para não ficar ativo na agenda
+        try:
+            cur_obs = (before.get("observacoes") or "").strip()
+            note = "Cancelado automaticamente (falha ao excluir)."
+            obs2 = (cur_obs + ("\n" if cur_obs else "") + note)[:2000]
+            exec_stmt(update(concretagens).where(concretagens.c.id == cid).values(
+                status="Cancelado",
+                observacoes=obs2,
+                updated_at=utcnow(),
+            ))
+            add_history(cid, "CANCEL_FALLBACK", before, {"status": "Cancelado"}, user)
+        except Exception:
+            pass
+        return False
 
+    # valida se sumiu mesmo
+    if get_concretagem_by_id(cid):
+        try:
+            cur_obs = (before.get("observacoes") or "").strip()
+            note = "Cancelado automaticamente (registro permaneceu após tentativa de exclusão)."
+            obs2 = (cur_obs + ("\n" if cur_obs else "") + note)[:2000]
+            exec_stmt(update(concretagens).where(concretagens.c.id == cid).values(
+                status="Cancelado",
+                observacoes=obs2,
+                updated_at=utcnow(),
+            ))
+            add_history(cid, "CANCEL_FALLBACK", before, {"status": "Cancelado"}, user)
+        except Exception:
+            pass
+        return False
 
-# =============================================================================
-# Conflicts
-# =============================================================================
+    return True
+
 
 def detect_schedule_conflicts(df: pd.DataFrame) -> list[dict]:
     if df is None or df.empty:
@@ -1655,11 +1685,13 @@ except Exception:
 # =============================================================================
 
 if menu == "Dashboard":
-    st.markdown("## 📌 Próximos serviços (7 dias)")
-    df_next = get_next_concretagens_df(7)
+    st.markdown("## 📅 Agenda por dia")
+    sel_date = st.date_input("Data", value=date.today(), format="DD/MM/YYYY", key=uniq_key("dash_date"))
+    st.caption("Selecione a data para ver o resumo e os agendamentos desse dia.")
+    df_next = get_concretagens_df(sel_date, sel_date)
 
     if df_next.empty:
-        st.info("Sem concretagens cadastradas para os próximos 7 dias.")
+        st.info("Sem agendamentos cadastrados para esta data.")
     else:
         with st.expander("🔎 Filtros", expanded=False):
             c1, c2, c3 = st.columns([2,2,2])
@@ -1702,7 +1734,7 @@ if menu == "Dashboard":
         total = int(len(show))
         total_m3 = float(show["volume_m3"].fillna(0).sum()) if "volume_m3" in show.columns else 0.0
         total_formas = int(show["formas_est"].fillna(0).sum()) if "formas_est" in show.columns else 0
-        qtd_hoje = int((show["data"] == today_local().isoformat()).sum()) if "data" in show.columns else 0
+        total_colabs = int(pd.to_numeric(show.get('colab_qtd'), errors='coerce').fillna(0).sum()) if 'colab_qtd' in show.columns else 0
 
         conflicts = detect_schedule_conflicts(show)
         qtd_conf = len(conflicts)
@@ -1710,8 +1742,8 @@ if menu == "Dashboard":
         k1, k2, k3, k4, k5 = st.columns([1.1,1.1,1.1,1.1,1.1])
         with k1: st.metric("Agendamentos", f"{total}")
         with k2: st.metric("Volume total", f"{fmt_compact_num(total_m3)} m³")
-        with k3: st.metric("Formas (período)", f"{total_formas}")
-        with k4: st.metric("Hoje", f"{qtd_hoje}")
+        with k3: st.metric("Formas (dia)", f"{total_formas}")
+        with k4: st.metric("Colaboradores (dia)", f"{total_colabs}")
         with k5: st.metric("Conflitos", f"{qtd_conf}")
 
         if qtd_conf > 0:
@@ -1739,7 +1771,7 @@ if menu == "Dashboard":
                 use_container_width=True,
                 key=uniq_key("dash_xlsx"),
             )
-            pbytes = make_pdf_bytes(exp, titulo="Agendamentos — Próximos 7 dias")
+            pbytes = make_pdf_bytes(exp, titulo="Agendamentos — Dia selecionado")
             if pbytes:
                 st.download_button(
                     "🧾 Baixar PDF (resumo)",
@@ -2210,19 +2242,19 @@ elif menu == "Agenda (lista)":
 
             c7, c8 = st.columns(2)
             with c7:
-                new_volume = st.number_input("Volume (m³)", min_value=0.0, value=float(row.get("volume_m3") or 0.0), step=1.0)
+                new_volume = st.number_input("Volume (m³)", min_value=0.0, value=_safe_float(row.get("volume_m3"), 0.0), step=1.0)
             with c8:
-                new_fck = st.number_input("FCK (MPa)", min_value=0.0, value=float(row.get("fck_mpa") or 0.0), step=1.0)
+                new_fck = st.number_input("FCK (MPa)", min_value=0.0, value=_safe_float(row.get("fck_mpa"), 0.0), step=1.0)
 
             c9, c10 = st.columns(2)
             with c9:
-                new_colab_qtd = st.number_input("Colaboradores na obra (qtd)", min_value=1, step=1, value=int(row.get("colab_qtd") or 1))
+                new_colab_qtd = st.number_input("Colaboradores na obra (qtd)", min_value=1, step=1, value=_safe_int(row.get("colab_qtd"), 1))
             with c10:
-                new_cap = st.number_input("Capacidade caminhão (m³) p/ estimativa", min_value=1.0, max_value=30.0, value=float(row.get("cap_caminhao_m3") or 8.0), step=0.5)
+                new_cap = st.number_input("Capacidade caminhão (m³) p/ estimativa", min_value=1.0, max_value=30.0, value=_safe_float(row.get("cap_caminhao_m3"), 8.0), step=0.5)
 
             c11, c12 = st.columns(2)
             with c11:
-                new_cps_por_cam = st.number_input("Corpos de prova por caminhão (séries)", min_value=1, max_value=10, value=_safe_int(row.get("cps_por_caminhao"), 6), step=1)
+                new_cps_por_cam = st.number_input("Corpos de prova por caminhão (séries)", min_value=1, max_value=10, value=int(row.get("cps_por_caminhao") or 6), step=1)
             with c12:
                 if new_tipo_servico == "Concretagem":
                     new_caminhoes_est = calc_trucks(new_volume, new_cap)
@@ -2290,8 +2322,11 @@ elif menu == "Agenda (lista)":
             can_del = (confirm_del.strip().upper() == "EXCLUIR")
             if st.button("Excluir agendamento", key=uniq_key(f"del_btn_{row['id']}"), disabled=not can_del):
                 try:
-                    delete_concretagem_by_id(int(row["id"]), current_user())
-                    st.success("Agendamento excluído.")
+                    ok = delete_concretagem_by_id(int(row["id"]), current_user())
+                    if ok:
+                        st.success("Agendamento excluído.")
+                    else:
+                        st.warning("Não foi possível excluir definitivamente. O agendamento foi marcado como Cancelado (quando permitido).")
                     st.rerun()
                 except Exception as e:
                     st.error(f"Falha ao excluir: {e}")
