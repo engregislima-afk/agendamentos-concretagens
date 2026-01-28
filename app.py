@@ -1162,6 +1162,7 @@ def migrate_schema(eng):
                     conn.execute(text(f"ALTER TABLE concretagens ADD COLUMN {ddl}"))
 
             add_col("slump_txt", "slump_txt TEXT")
+            add_col("tipo_servico", "tipo_servico TEXT")
             add_col("colab_qtd", "colab_qtd INTEGER DEFAULT 1")
             add_col("cap_caminhao_m3", "cap_caminhao_m3 DOUBLE PRECISION")
             add_col("cps_por_caminhao", "cps_por_caminhao INTEGER DEFAULT 4")
@@ -2422,13 +2423,6 @@ elif menu == "Novo agendamento":
             obra_sel = st.selectbox("Obra *", labels)
             tipo_servico = st.selectbox("Tipo de serviço *", SERVICE_TYPES, index=0)
             is_concretagem = (tipo_servico == "Concretagem")
-            tipo_servico = st.selectbox(
-                "Tipo de serviço *",
-                ["Concretagem", "Ensaio de solo", "Coleta de solo", "Arrancamento", "Coleta de blocos e prismas"],
-                index=0
-            )
-
-
             cA, cB = st.columns(2)
             with cA:
                 d = st.date_input("Data *", value=today)
@@ -2508,6 +2502,7 @@ elif menu == "Novo agendamento":
                     hora_inicio=hora_str,
                     duracao_min=int(dur),
                     volume_m3=float(volume),
+                    colab_qtd=int(colab_qtd),
                     fck_mpa=float(fck) if fck else None,
                     slump_mm=parse_number(slump, None),
                     slump_txt=(slump.strip() if slump else None),
