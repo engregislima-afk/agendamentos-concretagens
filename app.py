@@ -203,6 +203,9 @@ def render_concretagens_cards(df: "pd.DataFrame", title: str = ""):
         equipe = str(r.get("equipe","") or "").strip()
         status = str(r.get("status","") or "").strip() or "-"
         obs = str(r.get("observacoes","") or "").strip()
+        tipo_serv = str(r.get("tipo_servico","") or "").strip()
+        formas = r.get("formas_est","")
+        formas_txt = fmt_compact_num(formas, 0) if str(formas or "").strip() != "" else ""
         tipo_servico = str(r.get("tipo_servico","") or "").strip() or "Concretagem"
         try:
             formas = int(float(r.get("formas_est") or 0))
@@ -218,6 +221,8 @@ def render_concretagens_cards(df: "pd.DataFrame", title: str = ""):
         # linhas auxiliares
         sub_left = " • ".join([x for x in [cliente, cidade, (tipo_servico if tipo_servico and tipo_servico!="Concretagem" else "")] if x])
         sup = " | ".join([x for x in [("Usina: "+usina) if usina else "", ("Bomba: "+bomba) if bomba else "", ("Equipe: "+equipe) if equipe else ""] if x])
+        if formas_txt:
+            sup = (sup + (" | " if sup else "") + f"Formas: {formas_txt}")
 
         st.markdown(
             f"""
@@ -576,6 +581,18 @@ div[data-testid="stDataFrame"]{
 # Status + cores
 # ============================
 STATUS = ["Agendado", "Aguardando", "Confirmado", "Execucao", "Concluido", "Cancelado"]
+
+
+# Tipos de serviço (inclui concretagem e outros serviços de campo)
+SERVICE_TYPES = [
+    "Concretagem",
+    "Ensaio de Solo",
+    "Coleta de Solo",
+    "Arrancamento",
+    "Coleta de Blocos",
+    "Coleta de Prismas",
+]
+
 STATUS_LIST = STATUS  # alias para listas/filters
 
 def status_chip(status: str) -> str:
@@ -1549,7 +1566,7 @@ def get_concretagens_df(range_start, range_end) -> pd.DataFrame:
             "created_at","created_by","updated_at","updated_by","observacoes"
         ])
 
-    for col in ("duracao_min", "volume_m3", "fck_mpa", "slump_mm"):
+    for col in ("duracao_min", "volume_m3", "fck_mpa", "slump_mm", "colab_qtd", "cap_caminhao_m3", "cps_por_caminhao", "caminhoes_est", "formas_est"):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -1987,8 +2004,10 @@ if menu == "Dashboard":
         with k2:
             st.metric("Volume total", f"{fmt_compact_num(total_m3)} m³")
         with k3:
-            st.metric("Hoje", f"{qtd_hoje}")
+            st.metric("Formas (período)", f"{total_formas}")
         with k4:
+            st.metric("Hoje", f"{qtd_hoje}")
+        with k5:
             st.metric("Conflitos", f"{qtd_conf}")
         with k5:
             st.metric("Formas (cota)", f"{total_formas}")
@@ -2072,7 +2091,7 @@ if menu == "Dashboard":
             st.caption("📌 Dica: os cards mostram todas as informações **sem precisar arrastar para o lado**.")
             render_concretagens_cards(show_disp, title="")
         else:
-            cols = [c for c in ["data","hora_inicio","obra","cliente","cidade","volume_m3","fck_mpa","slump_mm","usina","bomba","equipe","status"] if c in show_disp.columns]
+            cols = [c for c in ["data","hora_inicio","obra","cliente","cidade","tipo_servico","volume_m3","fck_mpa","slump_mm","caminhoes_est","formas_est","usina","bomba","equipe","status"] if c in show_disp.columns]
             st.dataframe(
                 show_disp[cols],
                 use_container_width=True,
@@ -2382,7 +2401,7 @@ elif menu == "Agenda (calendário)":
                     if compact:
                         st.caption(f"{r.get('volume_m3','')} m³ • {r.get('bomba','')} • {r.get('equipe','')}")
                     else:
-                        st.caption(f"Serviço: {r.get('servico','')}")
+                        st.caption(f"Serviço: {r.get('tipo_servico','')}")
                         st.caption(f"Volume: {r.get('volume_m3','')} m³")
                         st.caption(f"Bomba/Equipe: {r.get('bomba','')} • {r.get('equipe','')}")
                         st.caption(f"Responsável: {r.get('responsavel','')}")
@@ -2401,6 +2420,8 @@ elif menu == "Novo agendamento":
         st.markdown('<div class="hab-card">', unsafe_allow_html=True)
         with st.form("form_conc_new"):
             obra_sel = st.selectbox("Obra *", labels)
+            tipo_servico = st.selectbox("Tipo de serviço *", SERVICE_TYPES, index=0)
+            is_concretagem = (tipo_servico == "Concretagem")
             tipo_servico = st.selectbox(
                 "Tipo de serviço *",
                 ["Concretagem", "Ensaio de solo", "Coleta de solo", "Arrancamento", "Coleta de blocos e prismas"],
@@ -2676,6 +2697,7 @@ elif menu == "Agenda (lista)":
 
                 st.success("Atualizado ✅")
                 st.rerun()
+
 
         st.markdown("---")
         with st.expander("🗑️ Excluir agendamento", expanded=False):
