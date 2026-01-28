@@ -2,7 +2,7 @@
 # - Streamlit + PostgreSQL (Supabase) via Secrets (DB_URL) ou SQLite local
 # - Login + Usuários (Admin)
 # - Auditoria: criado_por / alterado_por + histórico (antes/depois)
-# - CNPJ: busca automática (Razão Social / Fantasia / Endereço) via cnpj.ws
+# - CNPJ: busca automática (Razão Social / Fantasia / Endereço) via BrasilAPI / CNPJ.ws / ReceitaWS
 # - Status com cores (Agendado azul, Cancelado vermelho, Aguardando amarelo)
 #
 # Reqs (requirements.txt):
@@ -12,6 +12,11 @@
 #   requests
 #   sqlalchemy
 #   psycopg2-binary
+#
+# ✅ Patch (2026-01-28):
+# - Corrige crash no Postgres durante migrate_schema: usa ALTER TABLE IF EXISTS + try/except (não derruba o app)
+# - Corrige bug no "Editar agendamento": new_cps -> new_cps_por_cam
+# - Corrige KeyError na "Agenda (lista)" quando colunas não existem: seleciona apenas colunas presentes
 
 import os
 import io
@@ -19,12 +24,11 @@ import re
 import json
 import base64
 import hashlib
-import uuid
 import secrets
 import urllib.parse
 import socket
-
 import math
+
 try:
     from zoneinfo import ZoneInfo
 except Exception:
@@ -38,6 +42,19 @@ import pandas as pd
 import requests
 import streamlit as st
 
+from sqlalchemy import (
+    create_engine, MetaData, Table, Column,
+    Integer, String, Float, Text, ForeignKey, Boolean,
+    select, insert, update, text,
+    delete,
+)
+from sqlalchemy.engine import Engine
+
+
+# =============================================================================
+# Streamlit helpers
+# =============================================================================
+
 def uniq_key(prefix: str = "k") -> str:
     """Gera keys únicas por execução para evitar StreamlitDuplicateElementKey."""
     n = st.session_state.get("_uniq_key_counter", 0) + 1
@@ -45,11 +62,9 @@ def uniq_key(prefix: str = "k") -> str:
     return f"{prefix}_{n}"
 
 
-
 # =============================================================================
-# Helpers
+# Time helpers
 # =============================================================================
-
 
 def _local_tz():
     """Timezone used by the app (default: America/Sao_Paulo)."""
@@ -57,20 +72,27 @@ def _local_tz():
     try:
         return ZoneInfo(tzname)
     except Exception:
-        # Fallback to naive local time if ZoneInfo fails
         return None
 
 def _local_now():
     tz = _local_tz()
     return datetime.now(tz) if tz else datetime.now()
 
+def today_local() -> date:
+    return _local_now().date()
+
+def now_iso() -> str:
+    return _local_now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+# =============================================================================
+# Formatting helpers
+# =============================================================================
+
 def only_digits(s: str) -> str:
-    """Return only digits from string (safe for None)."""
     return re.sub(r"\D+", "", str(s or ""))
 
-
 def fmt_br(value, decimals=2, strip_zeros=True):
-    """Formata número para pt-BR (1.234,56) e remove zeros finais."""
     if value is None:
         return ""
     try:
@@ -78,63 +100,12 @@ def fmt_br(value, decimals=2, strip_zeros=True):
     except Exception:
         return str(value)
     s = f"{v:,.{decimals}f}"
-    # US -> pt-BR
     s = s.replace(",", "X").replace(".", ",").replace("X", ".")
     if strip_zeros and "," in s:
         s = s.rstrip("0").rstrip(",")
     return s
 
-def format_numbers_in_df(df):
-    """Deixa Volume/FCK/Slump sem aquele monte de zeros nas tabelas."""
-    if df is None:
-        return df
-    try:
-        out = df.copy()
-    except Exception:
-        return df
-    if "volume_m3" in out.columns:
-        out["volume_m3"] = out["volume_m3"].apply(lambda x: fmt_br(x, 2, True))
-    if "fck_mpa" in out.columns:
-        out["fck_mpa"] = out["fck_mpa"].apply(lambda x: fmt_br(x, 0, True))
-    if "slump_mm" in out.columns:
-        out["slump_mm"] = out["slump_mm"].apply(lambda x: fmt_br(x, 0, True))
-    return out
-
-def style_status_df(df, status_col="status"):
-    """Return a Styler that colors the status column (if present)."""
-    if df is None:
-        return df
-    try:
-        import pandas as _pd  # noqa
-    except Exception:
-        return df
-    if getattr(df, "empty", False) or status_col not in getattr(df, "columns", []):
-        return df
-
-    def _style(v):
-        v = (str(v or "")).strip().lower()
-        if v == "agendado":
-            return "background-color: rgba(59, 130, 246, .18); color: #1d4ed8; font-weight: 700;"
-        if v == "aguardando":
-            return "background-color: rgba(234, 179, 8, .22); color: #a16207; font-weight: 700;"
-        if v == "confirmado":
-            return "background-color: rgba(34, 197, 94, .18); color: #15803d; font-weight: 700;"
-        if v == "execução" or v == "execucao":
-            return "background-color: rgba(16, 185, 129, .18); color: #047857; font-weight: 700;"
-        if v == "concluído" or v == "concluido":
-            return "background-color: rgba(148, 163, 184, .22); color: #334155; font-weight: 700;"
-        if v == "cancelado":
-            return "background-color: rgba(239, 68, 68, .18); color: #b91c1c; font-weight: 700;"
-        return ""
-
-    try:
-        return df.style.applymap(_style, subset=[status_col])
-    except Exception:
-        return df
-
-
 def fmt_compact_num(v, decimals: int = 2) -> str:
-    """Formata números sem aquele monte de zeros (30.000000 -> 30, 25.50 -> 25.5)."""
     try:
         if v is None:
             return ""
@@ -142,7 +113,6 @@ def fmt_compact_num(v, decimals: int = 2) -> str:
             s = v.strip()
             if s == "":
                 return ""
-            # aceitar vírgula
             s = s.replace(".", "").replace(",", ".") if ("," in s and s.count(",") == 1 and s.count(".") > 1) else s.replace(",", ".")
             v = float(s)
         fv = float(v)
@@ -154,102 +124,7 @@ def fmt_compact_num(v, decimals: int = 2) -> str:
     except Exception:
         return str(v)
 
-def status_class(status: str) -> str:
-    s = (status or "").strip().lower()
-    if s in ("agendado",):
-        return "hab-badge-blue"
-    if s in ("aguardando",):
-        return "hab-badge-amber"
-    if s in ("confirmado",):
-        return "hab-badge-green"
-    if s in ("execucao", "execução"):
-        return "hab-badge-purple"
-    if s in ("concluido", "concluído"):
-        return "hab-badge-slate"
-    if s in ("cancelado",):
-        return "hab-badge-red"
-    return "hab-badge-slate"
-
-def render_concretagens_cards(df: "pd.DataFrame", title: str = ""):
-    """Renderiza próximos agendamentos em cards (sem scroll horizontal)."""
-    if df is None or df.empty:
-        st.info("Nenhum agendamento encontrado para este período/filtro.")
-        return
-
-    if title:
-        st.markdown(f"### {title}")
-
-    # manter uma ordem amigável
-    cols_pref = ["data","hora_inicio","obra","cliente","cidade","tipo_servico","volume_m3","caminhoes_est","formas_est","fck_mpa","slump_mm","usina","bomba","equipe","status","observacoes"]
-    for c in cols_pref:
-        if c not in df.columns:
-            df[c] = ""
-
-    for _, r in df.iterrows():
-        data = str(r.get("data","") or "")
-        hora = str(r.get("hora_inicio","") or "")
-        obra = str(r.get("obra","") or "")
-        cliente = str(r.get("cliente","") or "")
-        cidade = str(r.get("cidade","") or "")
-        vol = fmt_compact_num(r.get("volume_m3",""))
-        fck = fmt_compact_num(r.get("fck_mpa",""))
-        slump = fmt_compact_num(r.get("slump_mm",""))
-        tipo_servico = str(r.get("tipo_servico","") or r.get("servico","") or "").strip() or "Concretagem"
-        if tipo_servico and str(tipo_servico).strip() != "Concretagem":
-            vol = "-"
-            fck = "-"
-            slump = "-"
-        usina = str(r.get("usina","") or "").strip()
-        bomba = str(r.get("bomba","") or "").strip()
-        equipe = str(r.get("equipe","") or "").strip()
-        status = str(r.get("status","") or "").strip() or "-"
-        obs = str(r.get("observacoes","") or "").strip()
-        tipo_serv = str(r.get("tipo_servico","") or "").strip()
-        formas = r.get("formas_est","")
-        formas_txt = fmt_compact_num(formas, 0) if str(formas or "").strip() != "" else ""
-        try:
-            formas = int(float(r.get("formas_est") or 0))
-        except Exception:
-            formas = 0
-        try:
-            cam = int(float(r.get("caminhoes_est") or 0))
-        except Exception:
-            cam = 0
-
-        badge_cls = status_class(status)
-
-        # linhas auxiliares
-        sub_left = " • ".join([x for x in [cliente, cidade, (tipo_servico if tipo_servico and tipo_servico!="Concretagem" else "")] if x])
-        sup = " | ".join([x for x in [("Usina: "+usina) if usina else "", ("Bomba: "+bomba) if bomba else "", ("Equipe: "+equipe) if equipe else ""] if x])
-        if formas_txt:
-            sup = (sup + (" | " if sup else "") + f"Formas: {formas_txt}")
-
-        st.markdown(
-            f"""
-            <div class="hab-row-card">
-              <div class="hab-row-top">
-                <div class="hab-row-when">📅 <b>{data}</b> &nbsp;•&nbsp; ⏱️ <b>{hora}</b></div>
-                <div class="hab-badge {badge_cls}">{status}</div>
-              </div>
-              <div class="hab-row-main">
-                <div class="hab-row-title">{obra}</div>
-                <div class="hab-row-sub">{sub_left}</div>
-              </div>
-              <div class="hab-row-grid">
-                <div><span class="hab-k">Volume</span><span class="hab-v">{vol} m³</span></div>
-                <div><span class="hab-k">FCK</span><span class="hab-v">{fck} MPa</span></div>
-                <div><span class="hab-k">Slump</span><span class="hab-v">{slump} mm</span></div>
-                <div><span class="hab-k">Operação</span><span class="hab-v">{sup if sup else "-"}</span></div>
-              </div>
-              {f'<div class="hab-row-obs">🧪 Formas (cota): <b>{formas}</b>{(" • Caminhões: <b>"+str(cam)+"</b>") if cam else ""}</div>' if (tipo_servico=="Concretagem" and (formas or cam)) else ''}
-              {f'<div class="hab-row-obs">📝 {obs}</div>' if obs else ''}
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
 def parse_number(s, default=None):
-    """Parse first number from text (accepts comma as decimal). Returns float or default."""
     try:
         if s is None:
             return default
@@ -264,11 +139,7 @@ def parse_number(s, default=None):
     except Exception:
         return default
 
-
 def calc_hora_fim(hora_inicio: str, duracao_min: Optional[int]) -> str:
-    """Calcula hora fim (HH:MM) a partir da hora inicial e duração em minutos.
-    Retorna string vazia se a entrada for inválida.
-    """
     try:
         if not hora_inicio:
             return ""
@@ -281,19 +152,84 @@ def calc_hora_fim(hora_inicio: str, duracao_min: Optional[int]) -> str:
     except Exception:
         return ""
 
+def ensure_date(x) -> date:
+    """Coerce inputs (date/datetime/str/Timestamp) to a `datetime.date`."""
+    if x is None:
+        return date.today()
+    try:
+        if isinstance(x, pd.Timestamp):
+            x = x.to_pydatetime()
+    except Exception:
+        pass
+    if isinstance(x, datetime):
+        return x.date()
+    if isinstance(x, date):
+        return x
+    if isinstance(x, str):
+        s = x.strip()
+        if not s:
+            return date.today()
+        try:
+            return date.fromisoformat(s[:10])
+        except Exception:
+            pass
+        try:
+            return datetime.strptime(s[:10], "%d/%m/%Y").date()
+        except Exception:
+            pass
+    try:
+        return date.fromisoformat(str(x)[:10])
+    except Exception:
+        return date.today()
 
-from sqlalchemy import (
-    create_engine, MetaData, Table, Column,
-    Integer, String, Float, Text, ForeignKey, Boolean,
-    select, insert, update, text, and_, or_,
-    delete,
-)
+def to_dt(d: str, h: str) -> datetime:
+    return datetime.strptime(f"{d} {h}", "%Y-%m-%d %H:%M")
+
+def to_time(v) -> dt.time:
+    if v is None:
+        return dt.time(0, 0)
+    if isinstance(v, dt.time) and not isinstance(v, dt.datetime):
+        return v
+    if isinstance(v, dt.datetime):
+        return v.time()
+    s = str(v).strip()
+    if not s:
+        return dt.time(0, 0)
+    for fmt in ("%H:%M", "%H:%M:%S"):
+        try:
+            return dt.datetime.strptime(s, fmt).time()
+        except Exception:
+            pass
+    ds = re.sub(r"\D+", "", s)
+    if len(ds) in (3, 4):
+        try:
+            h = int(ds[:-2])
+            m = int(ds[-2:])
+            if 0 <= h <= 23 and 0 <= m <= 59:
+                return dt.time(h, m)
+        except Exception:
+            pass
+    return dt.time(0, 0)
+
+def intervals_overlap(ai: dt.time, af: dt.time, bi: dt.time, bf: dt.time) -> bool:
+    try:
+        a0 = ai.hour * 60 + ai.minute
+        a1 = af.hour * 60 + af.minute
+        b0 = bi.hour * 60 + bi.minute
+        b1 = bf.hour * 60 + bf.minute
+    except Exception:
+        return False
+    if a1 < a0:
+        a0, a1 = a1, a0
+    if b1 < b0:
+        b0, b1 = b1, b0
+    return max(a0, b0) < min(a1, b1)
+
 
 # =============================================================================
-# SCHEMA (SQLAlchemy Core)
+# SQLAlchemy schema (Core)
 # =============================================================================
-# Obs: Mantemos tipos simples (String/Float/Integer/Boolean) para compatibilidade
-# entre SQLite (local) e Postgres/Supabase (nuvem).
+
 metadata = MetaData()
 
 users = Table(
@@ -348,7 +284,7 @@ concretagens = Table(
     Column("usina", String(200), nullable=True),
     Column("bomba", String(200), nullable=True),
     Column("equipe", String(200), nullable=True),
-        Column("colab_qtd", Integer, nullable=True),
+    Column("colab_qtd", Integer, nullable=True),
     Column("tipo_servico", String(120), nullable=True),
 
     Column("cap_caminhao_m3", Float, nullable=True),
@@ -386,13 +322,13 @@ config = Table(
     Column("atualizado_por", String(120), nullable=True),
 )
 
-from sqlalchemy.engine import Engine
-
 TZ_LABEL = "America/Sao_Paulo"
 
-# ============================
-# Windows 11-ish styling
-# ============================
+
+# =============================================================================
+# UI/CSS
+# =============================================================================
+
 WIN11_CSS = """/* ============================
    Habisolute — Tema (Laranja + Dark Sidebar)
    ============================ */
@@ -407,27 +343,16 @@ WIN11_CSS = """/* ============================
   --hab-text:#0f172a;
   --hab-muted:#64748b;
 }
-
-
-
-/* Títulos um pouco mais abaixo */
 .block-container h1{ margin-top: .25rem !important; }
-/* Fundo geral */
 .stApp{
   background: linear-gradient(180deg, #fff7ed 0%, #ffffff 40%, #f8fafc 100%) !important;
 }
-
-/* Centralização / largura */
- .block-container{
+.block-container{
   padding-top: 3.6rem !important;
   padding-bottom: 2.2rem !important;
   max-width: 1200px !important;
 }
-/* Título das páginas – descer um pouco */
 h1, h2, h3{ margin-top: .35rem !important; }
-
-
-/* Cards “macios” */
 div[data-testid="stVerticalBlock"] > div:has(> div[data-testid="stMetric"]) {
   background: var(--hab-card);
   border: 1px solid var(--hab-border);
@@ -435,20 +360,12 @@ div[data-testid="stVerticalBlock"] > div:has(> div[data-testid="stMetric"]) {
   padding: 14px 14px 6px 14px;
   box-shadow: 0 6px 22px rgba(2, 6, 23, .06);
 }
-
-/* Sidebar dark */
 section[data-testid="stSidebar"] > div{
   background: linear-gradient(180deg, var(--hab-dark) 0%, var(--hab-slate) 100%) !important;
   border-right: 1px solid rgba(255,255,255,.08);
 }
-section[data-testid="stSidebar"] *{
-  color: rgba(255,255,255,.90) !important;
-}
-section[data-testid="stSidebar"] a{
-  color: rgba(255,255,255,.90) !important;
-}
-
-/* Radio do menu */
+section[data-testid="stSidebar"] *{ color: rgba(255,255,255,.90) !important; }
+section[data-testid="stSidebar"] a{ color: rgba(255,255,255,.90) !important; }
 section[data-testid="stSidebar"] .stRadio div[role="radiogroup"] label{
   background: rgba(255,255,255,.06);
   border: 1px solid rgba(255,255,255,.10);
@@ -464,8 +381,6 @@ section[data-testid="stSidebar"] .stRadio div[role="radiogroup"] label:has(input
   background: rgba(255,90,0,.20);
   border-color: rgba(255,90,0,.95);
 }
-
-/* Inputs – mais visíveis */
 div[data-baseweb="input"] > div,
 div[data-baseweb="textarea"] > div,
 div[data-baseweb="select"] > div{
@@ -481,8 +396,6 @@ div[data-baseweb="textarea"] textarea{
 label, .stMarkdown, .stTextInput label, .stNumberInput label, .stSelectbox label{
   color: var(--hab-text) !important;
 }
-
-/* Inputs na sidebar (ficam escuros) */
 section[data-testid="stSidebar"] div[data-baseweb="input"] > div,
 section[data-testid="stSidebar"] div[data-baseweb="textarea"] > div,
 section[data-testid="stSidebar"] div[data-baseweb="select"] > div{
@@ -493,16 +406,12 @@ section[data-testid="stSidebar"] div[data-baseweb="input"] input,
 section[data-testid="stSidebar"] div[data-baseweb="textarea"] textarea{
   color: rgba(255,255,255,.92) !important;
 }
-
-/* Focus (borda laranja) */
 div[data-baseweb="input"] > div:focus-within,
 div[data-baseweb="textarea"] > div:focus-within,
 div[data-baseweb="select"] > div:focus-within{
   border-color: rgba(255,90,0,.90) !important;
   box-shadow: 0 0 0 3px rgba(255,90,0,.22) !important;
 }
-
-/* Botões */
 .stButton>button{
   border-radius: 14px !important;
   font-weight: 800 !important;
@@ -518,16 +427,12 @@ div[data-baseweb="select"] > div:focus-within{
   background: var(--hab-orange-2) !important;
   box-shadow: 0 8px 20px rgba(255,90,0,.22) !important;
 }
-
-/* Dataframes */
 div[data-testid="stDataFrame"]{
   border-radius: 16px !important;
   overflow: hidden !important;
   border: 1px solid var(--hab-border) !important;
   box-shadow: 0 10px 24px rgba(2, 6, 23, .06) !important;
 }
-
-/* Cards de listagem (Dashboard) */
 .hab-row-card{
   background: var(--hab-card);
   border: 1px solid var(--hab-border);
@@ -555,8 +460,6 @@ div[data-testid="stDataFrame"]{
 .hab-k{ display:block; font-size: 11px; color: var(--hab-muted); text-transform: uppercase; letter-spacing: .04em; }
 .hab-v{ display:block; font-weight: 800; color: var(--hab-text); font-size: 13px; margin-top: 2px; word-break: break-word; }
 .hab-row-obs{ margin-top: 10px; padding-top: 10px; border-top: 1px dashed rgba(15, 23, 42, .12); color: var(--hab-text); font-size: 13px; }
-
-/* Badges status */
 .hab-badge{
   padding: 6px 10px;
   border-radius: 999px;
@@ -570,20 +473,12 @@ div[data-testid="stDataFrame"]{
 .hab-badge-purple{ background: rgba(139,92,246,.16); color: #5b21b6; border-color: rgba(139,92,246,.28); }
 .hab-badge-slate{ background: rgba(100,116,139,.14); color: #334155; border-color: rgba(100,116,139,.26); }
 .hab-badge-red{ background: rgba(239,68,68,.16); color: #b91c1c; border-color: rgba(239,68,68,.28); }
-
-/* responsivo */
 @media (max-width: 900px){
   .hab-row-grid{ grid-template-columns: 1fr 1fr; }
 }
 """
 
-# ============================
-# Status + cores
-# ============================
 STATUS = ["Agendado", "Aguardando", "Confirmado", "Execucao", "Concluido", "Cancelado"]
-
-
-# Tipos de serviço (inclui concretagem e outros serviços de campo)
 SERVICE_TYPES = [
     "Concretagem",
     "Ensaio de Solo",
@@ -593,7 +488,34 @@ SERVICE_TYPES = [
     "Coleta de Prismas",
 ]
 
-STATUS_LIST = STATUS  # alias para listas/filters
+
+def _norm_status(s: str) -> str:
+    s = str(s or "").strip().lower()
+    trans = str.maketrans({
+        "á":"a","à":"a","â":"a","ã":"a",
+        "é":"e","ê":"e",
+        "í":"i",
+        "ó":"o","ô":"o","õ":"o",
+        "ú":"u",
+        "ç":"c",
+    })
+    return s.translate(trans)
+
+def status_class(status: str) -> str:
+    s = _norm_status(status)
+    if s in ("agendado",):
+        return "hab-badge-blue"
+    if s in ("aguardando",):
+        return "hab-badge-amber"
+    if s in ("confirmado",):
+        return "hab-badge-green"
+    if s in ("execucao",):
+        return "hab-badge-purple"
+    if s in ("concluido",):
+        return "hab-badge-slate"
+    if s in ("cancelado",):
+        return "hab-badge-red"
+    return "hab-badge-slate"
 
 def status_chip(status: str) -> str:
     s = (status or "").strip()
@@ -610,98 +532,82 @@ def status_chip(status: str) -> str:
         cls = "gray"
     return f'<span class="hab-chip {cls}">{s}</span>'
 
-def style_status_df(df: pd.DataFrame) -> "pd.io.formats.style.Styler":
-    """Aplica cores por status + formatação numérica BR (sem 'monte de zeros')."""
-    color_map = {
-        "Agendado": ("#1d4ed8", "#e8efff"),
-        "Cancelado": ("#b91c1c", "#ffecec"),
-        "Aguardando": ("#92400e", "#fff7ed"),
-        "Confirmado": ("#166534", "#eaffea"),
-        "Execucao": ("#166534", "#eaffea"),
-        "Concluido": ("#374151", "#f1f5f9"),
-    }
+def render_concretagens_cards(df: "pd.DataFrame", title: str = ""):
+    if df is None or df.empty:
+        st.info("Nenhum agendamento encontrado para este período/filtro.")
+        return
+    if title:
+        st.markdown(f"### {title}")
 
-    def _fmt_num(v, nd=2):
-        if v is None:
-            return ""
+    cols_pref = ["data","hora_inicio","obra","cliente","cidade","tipo_servico","volume_m3","caminhoes_est","formas_est","fck_mpa","slump_mm","usina","bomba","equipe","status","observacoes"]
+    for c in cols_pref:
+        if c not in df.columns:
+            df[c] = ""
+
+    for _, r in df.iterrows():
+        data = str(r.get("data","") or "")
+        hora = str(r.get("hora_inicio","") or "")
+        obra = str(r.get("obra","") or "")
+        cliente = str(r.get("cliente","") or "")
+        cidade = str(r.get("cidade","") or "")
+        vol = fmt_compact_num(r.get("volume_m3",""))
+        fck = fmt_compact_num(r.get("fck_mpa",""))
+        slump = fmt_compact_num(r.get("slump_mm",""))
+        tipo_servico = str(r.get("tipo_servico","") or r.get("servico","") or "").strip() or "Concretagem"
+        if tipo_servico and str(tipo_servico).strip() != "Concretagem":
+            vol = "-"
+            fck = "-"
+            slump = "-"
+        usina = str(r.get("usina","") or "").strip()
+        bomba = str(r.get("bomba","") or "").strip()
+        equipe = str(r.get("equipe","") or "").strip()
+        status = str(r.get("status","") or "").strip() or "-"
+        obs = str(r.get("observacoes","") or "").strip()
+
         try:
-            fv = float(v)
+            formas = int(float(r.get("formas_est") or 0))
         except Exception:
-            return str(v)
-        import math
-        if math.isnan(fv):
-            return ""
-        s = f"{fv:.{nd}f}".replace(".", ",")
-        # remove zeros à direita (30,00 -> 30; 100,00 -> 100; 25,50 mantém)
-        if "," in s:
-            s = s.rstrip("0").rstrip(",")
-        return s
+            formas = 0
+        try:
+            cam = int(float(r.get("caminhoes_est") or 0))
+        except Exception:
+            cam = 0
 
-    def _apply(col: pd.Series):
-        styles = []
-        for v in col.astype(str).tolist():
-            fg, bg = color_map.get(v, ("#374151", "#f1f5f9"))
-            styles.append(f"background-color: {bg}; color: {fg}; font-weight: 700;")
-        return styles
+        badge_cls = status_class(status)
 
-    sty = df.style
+        sub_left = " • ".join([x for x in [cliente, cidade, (tipo_servico if tipo_servico and tipo_servico!="Concretagem" else "")] if x])
+        sup = " | ".join([x for x in [("Usina: "+usina) if usina else "", ("Bomba: "+bomba) if bomba else "", ("Equipe: "+equipe) if equipe else ""] if x])
 
-    # Formatação de números mais "limpa"
-    fmt: dict = {}
-    if "volume_m3" in df.columns:
-        fmt["volume_m3"] = lambda v: _fmt_num(v, 2)
-    if "fck_mpa" in df.columns:
-        fmt["fck_mpa"] = lambda v: _fmt_num(v, 2)
-    if "slump_mm" in df.columns:
-        fmt["slump_mm"] = lambda v: _fmt_num(v, 0)
-    if "duracao_min" in df.columns:
-        fmt["duracao_min"] = lambda v: _fmt_num(v, 0)
-
-    if fmt:
-        sty = sty.format(fmt, na_rep="")
-
-    if "status" in df.columns:
-        sty = sty.apply(_apply, subset=["status"])
-
-    # Cabeçalho com cara Habisolute
-    sty = sty.set_table_styles([
-        {"selector": "th", "props": [("background-color", "#ff5a00"), ("color", "white"), ("font-weight", "800")]},
-        {"selector": "td", "props": [("border-color", "rgba(15,23,42,.08)")]},
-    ])
-
-    return sty
+        st.markdown(
+            f"""
+            <div class="hab-row-card">
+              <div class="hab-row-top">
+                <div class="hab-row-when">📅 <b>{data}</b> &nbsp;•&nbsp; ⏱️ <b>{hora}</b></div>
+                <div class="hab-badge {badge_cls}">{status}</div>
+              </div>
+              <div class="hab-row-main">
+                <div class="hab-row-title">{obra}</div>
+                <div class="hab-row-sub">{sub_left}</div>
+              </div>
+              <div class="hab-row-grid">
+                <div><span class="hab-k">Volume</span><span class="hab-v">{vol} m³</span></div>
+                <div><span class="hab-k">FCK</span><span class="hab-v">{fck} MPa</span></div>
+                <div><span class="hab-k">Slump</span><span class="hab-v">{slump} mm</span></div>
+                <div><span class="hab-k">Operação</span><span class="hab-v">{sup if sup else "-"}</span></div>
+              </div>
+              {f'<div class="hab-row-obs">🧪 Formas (cota): <b>{formas}</b>{(" • Caminhões: <b>"+str(cam)+"</b>") if cam else ""}</div>' if (tipo_servico=="Concretagem" and (formas or cam)) else ''}
+              {f'<div class="hab-row-obs">📝 {obs}</div>' if obs else ''}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
 
+# =============================================================================
+# Config (key/value)
+# =============================================================================
 
-def fmt_nozeros(x):
-    try:
-        if x is None or (isinstance(x, float) and pd.isna(x)) or (hasattr(pd, "isna") and pd.isna(x)):
-            return ""
-        # deixa sem zeros finais (ex.: 30.0 -> 30 ; 30.50 -> 30.5)
-        s = f"{float(x):.2f}"
-        s = s.rstrip("0").rstrip(".")
-        return s
-    except Exception:
-        return str(x)
-
-def format_df_numbers(df: pd.DataFrame) -> "pd.io.formats.style.Styler":
-    df2 = df.copy()
-    fmt = {}
-    for c in ["volume_m3", "fck_mpa", "slump_mm", "duracao_min"]:
-        if c in df2.columns:
-            fmt[c] = fmt_nozeros
-    sty = df2.style.format(fmt)
-    return sty
-
-def today_local() -> date:
-    return _local_now().date()
-
-def now_iso() -> str:
-    return _local_now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def get_config_value(key: str, default: str | None = None) -> str | None:
-    """Lê um valor simples da tabela config (key/value)."""
+def get_config_value(key: str, default: Optional[str] = None) -> Optional[str]:
     try:
         eng = get_engine()
         sql = text("SELECT valor FROM config WHERE chave = :k")
@@ -714,7 +620,6 @@ def get_config_value(key: str, default: str | None = None) -> str | None:
         return default
 
 def set_config_value(key: str, value: str, user: str = 'system') -> None:
-    """Salva um valor simples na tabela config (upsert compatível com Postgres e SQLite)."""
     eng = get_engine()
     ts = now_iso()
     with eng.begin() as con:
@@ -731,7 +636,6 @@ def set_config_value(key: str, value: str, user: str = 'system') -> None:
                 """
             )
         else:
-            # SQLite
             sql = text(
                 """
                 INSERT OR REPLACE INTO config (chave, valor, atualizado_em, atualizado_por)
@@ -740,37 +644,23 @@ def set_config_value(key: str, value: str, user: str = 'system') -> None:
             )
         con.execute(sql, {'k': key, 'v': str(value), 'ts': ts, 'u': user})
 
-
-# -----------------------------------------------------------------------------
-# Config helpers (typed) — wrappers para evitar NameError e padronizar o uso
-# -----------------------------------------------------------------------------
 def _cfg_user_fallback() -> str:
-    """Usuário para auditoria quando `current_user()` não estiver disponível."""
     try:
         u = st.session_state.get("user") or {}
         return str(u.get("username") or "system")
     except Exception:
         return "system"
 
-
 def config_get_int(key: str, default: int = 0) -> int:
-    """Lê uma configuração como inteiro."""
     v = get_config_value(key)
     if (v is None or str(v).strip() == "") and key == "team_capacity":
-        # compatibilidade com chave antiga
         v = get_config_value("capacidade_colaboradores")
     try:
         return int(float(str(v).strip().replace(",", ".")))
     except Exception:
         return int(default)
 
-
 def config_set_int(key: str, value: int, user: Optional[str] = None) -> None:
-    """Salva uma configuração inteira.
-
-    Compatibilidade:
-    - `team_capacity` também grava em `capacidade_colaboradores` (chave antiga).
-    """
     u = user or _cfg_user_fallback()
     try:
         iv = int(value)
@@ -784,26 +674,12 @@ def get_team_capacity(default: int = 12) -> int:
     n = config_get_int("team_capacity", default)
     return max(1, int(n) if isinstance(n, int) else default)
 
-def _norm_status(s: str) -> str:
-    s = str(s or "").strip().lower()
-    # remoção simples de acentos comuns em PT-BR
-    trans = str.maketrans({
-        "á":"a","à":"a","â":"a","ã":"a",
-        "é":"e","ê":"e",
-        "í":"i",
-        "ó":"o","ô":"o","õ":"o",
-        "ú":"u",
-        "ç":"c",
-    })
-    return s.translate(trans)
-
 _COMMITTED = {"agendado", "aguardando", "confirmado", "execucao"}
 
 def is_committed_status(status: str) -> bool:
     return _norm_status(status) in _COMMITTED
 
 def get_committed_collaborators(date_str: str) -> int:
-    """Soma colab_qtd do dia (apenas status em atendimento: Agendado/Aguardando/Confirmado/Execucao)."""
     try:
         eng = get_engine()
         sql = text(
@@ -819,100 +695,12 @@ def get_committed_collaborators(date_str: str) -> int:
     except Exception:
         return 0
 
-def to_dt(d: str, h: str) -> datetime:
-    return datetime.strptime(f"{d} {h}", "%Y-%m-%d %H:%M")
 
-def ensure_date(x) -> date:
-    """Coerce inputs (date/datetime/str/Timestamp) to a `datetime.date`.
-    Accepts ISO strings (YYYY-MM-DD) and common BR format (DD/MM/YYYY).
-    """
-    if x is None:
-        return date.today()
-    # pandas Timestamp
-    try:
-        import pandas as _pd
-        if isinstance(x, _pd.Timestamp):
-            x = x.to_pydatetime()
-    except Exception:
-        pass
-    if isinstance(x, datetime):
-        return x.date()
-    if isinstance(x, date):
-        return x
-    if isinstance(x, str):
-        s = x.strip()
-        if not s:
-            return date.today()
-        # ISO
-        try:
-            return date.fromisoformat(s[:10])
-        except Exception:
-            pass
-        # BR
-        try:
-            return datetime.strptime(s[:10], "%d/%m/%Y").date()
-        except Exception:
-            pass
-    # last resort
-    try:
-        return date.fromisoformat(str(x)[:10])
-    except Exception:
-        return date.today()
-
-
-def to_time(v) -> dt.time:
-    """Converte valores variados (str 'HH:MM', datetime, time) para datetime.time."""
-    if v is None:
-        return dt.time(0, 0)
-    if isinstance(v, dt.time) and not isinstance(v, dt.datetime):
-        return v
-    if isinstance(v, dt.datetime):
-        return v.time()
-    s = str(v).strip()
-    if not s:
-        return dt.time(0, 0)
-    for fmt in ("%H:%M", "%H:%M:%S"):
-        try:
-            return dt.datetime.strptime(s, fmt).time()
-        except Exception:
-            pass
-    ds = re.sub(r"\D+", "", s)
-    if len(ds) in (3, 4):
-        try:
-            h = int(ds[:-2])
-            m = int(ds[-2:])
-            if 0 <= h <= 23 and 0 <= m <= 59:
-                return dt.time(h, m)
-        except Exception:
-            pass
-    return dt.time(0, 0)
-
-
-def intervals_overlap(ai: dt.time, af: dt.time, bi: dt.time, bf: dt.time) -> bool:
-    """Retorna True se dois intervalos de horário (mesmo dia) se sobrepõem."""
-    try:
-        a0 = ai.hour * 60 + ai.minute
-        a1 = af.hour * 60 + af.minute
-        b0 = bi.hour * 60 + bi.minute
-        b1 = bf.hour * 60 + bf.minute
-    except Exception:
-        return False
-    # garante ordem (caso venha invertido)
-    if a1 < a0:
-        a0, a1 = a1, a0
-    if b1 < b0:
-        b0, b1 = b1, b0
-    return max(a0, b0) < min(a1, b1)
-
-def overlap(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> bool:
-    return max(a_start, b_start) < min(a_end, b_end)
-
-# ============================
-# DB (SQLite local OR Postgres via DB_URL in secrets)
-# ============================
+# =============================================================================
+# DB Engine
+# =============================================================================
 
 def _ensure_sslmode_require(db_url: str) -> str:
-    """Supabase Postgres requires SSL. If sslmode is not present, append sslmode=require."""
     if not db_url:
         return db_url
     u = db_url.strip()
@@ -924,7 +712,6 @@ def _ensure_sslmode_require(db_url: str) -> str:
     return u
 
 def _safe_db_host(db_url: str) -> str:
-    """Return a redacted host string for debugging without leaking credentials."""
     try:
         pr = urllib.parse.urlparse(db_url)
         host = pr.hostname or ""
@@ -933,17 +720,8 @@ def _safe_db_host(db_url: str) -> str:
     except Exception:
         return ""
 
-
 @st.cache_resource(show_spinner=False)
 def get_engine() -> Engine:
-    """Cria e cacheia o Engine SQLAlchemy (SQLite local ou Postgres via secrets/env).
-
-    Melhorias incluídas:
-    - fallback para variáveis de ambiente (DB_URL/DATABASE_URL)
-    - pool_pre_ping/pool_recycle para conexões mais estáveis
-    - opcional: força resolução IPv4 (útil em alguns Windows/DNS) quando psycopg2 estiver disponível
-    """
-    # 1) Fonte da URL do banco
     db_url = None
     try:
         db_url = (
@@ -957,20 +735,16 @@ def get_engine() -> Engine:
 
     if not db_url:
         db_url = os.environ.get("DB_URL") or os.environ.get("DATABASE_URL")
-    # For Supabase/Postgres on cloud, SSL is usually required.
+
     if db_url and db_url.startswith('postgres') and 'sslmode=' not in db_url:
         sep = '&' if '?' in db_url else '?'
         db_url = db_url + f"{sep}sslmode=require"
 
-    # Supabase pooler strings sometimes omit the '+psycopg2' driver; SQLAlchemy handles it.
-
-    # 2) Se tiver URL explícita, usa-a
     if db_url:
         db_url = db_url.strip()
         if db_url.startswith("postgres"):
             db_url = _ensure_sslmode_require(db_url)
 
-            # --- opcional: forçar IPv4 via creator (reduz falhas DNS/IPv6 em alguns ambientes) ---
             force_ipv4 = os.environ.get("HABI_FORCE_IPV4", "1").strip().lower() not in ("0", "false", "no")
             if force_ipv4:
                 try:
@@ -981,12 +755,10 @@ def get_engine() -> Engine:
 
                     ipv4 = None
                     try:
-                        # 1) try direct IPv4 lookup
                         for res in socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM):
                             ipv4 = res[4][0]
                             break
                     except Exception:
-                        # 2) fallback: lookup any family and pick the first IPv4
                         try:
                             for res in socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM):
                                 if res and res[0] == socket.AF_INET:
@@ -1025,108 +797,23 @@ def get_engine() -> Engine:
 
             return create_engine(db_url, future=True, pool_pre_ping=True, pool_recycle=3600)
 
-        # SQLite ou outro driver
         if db_url.startswith("sqlite"):
             return create_engine(db_url, future=True, connect_args={"check_same_thread": False})
         return create_engine(db_url, future=True, pool_pre_ping=True)
 
-    # 3) Padrão local (SQLite)
     return create_engine("sqlite:///agendamentos.db", future=True, connect_args={"check_same_thread": False})
+
+
+# =============================================================================
+# ✅ MIGRATION (patched)
+# =============================================================================
+
 def migrate_schema(eng):
-    """Aplica migrações simples (ADD COLUMN) quando o banco já existe com schema antigo.
-    Não remove nem altera colunas existentes.
     """
-    try:
-        from sqlalchemy import inspect
-    except Exception:
-        return
-
-    dialect = getattr(eng.dialect, "name", "")
-    insp = inspect(eng)
-
-    def existing_cols(table_name: str) -> set:
-        try:
-            return {c["name"] for c in insp.get_columns(table_name)}
-        except Exception:
-            return set()
-
-    # Tipos por dialeto (suficiente para Postgres e SQLite)
-    def t_varchar(n=255):
-        return f"VARCHAR({n})" if dialect != "sqlite" else "TEXT"
-
-    def t_text():
-        return "TEXT"
-
-    def t_float():
-        return "DOUBLE PRECISION" if dialect != "sqlite" else "REAL"
-
-    def t_int():
-        return "INTEGER"
-
-    def t_ts():
-        return "TIMESTAMP" if dialect != "sqlite" else "TEXT"
-
-    desired = {
-        "obras": {
-            "nome": t_varchar(255),
-            "cliente": t_varchar(255),
-            "cnpj": t_varchar(40),
-            "endereco": t_varchar(255),
-            "cidade": t_varchar(120),
-            "uf": t_varchar(8),
-            "responsavel": t_varchar(120),
-            "telefone": t_varchar(40),
-            "email": t_varchar(120),
-            "observacoes": t_text(),
-            "criado_em": t_ts(),
-            "atualizado_em": t_ts(),
-            "criado_por": t_varchar(80),
-            "alterado_por": t_varchar(80),
-        },
-        "concretagens": {
-            "obra_id": t_int(),
-            "obra": t_varchar(255),
-            "cliente": t_varchar(255),
-            "cidade": t_varchar(120),
-            "data": t_varchar(20),
-            "hora_inicio": t_varchar(10),
-            "hora_fim": t_varchar(10),
-            "volume": t_float(),
-            "fornecedor": t_varchar(255),
-            "fck": t_float(),
-            "slump": t_float(),
-            "tipo_servico": t_varchar(120),
-            "observacoes": t_text(),
-            "criado_em": t_ts(),
-            "atualizado_em": t_ts(),
-            "criado_por": t_varchar(80),
-            "alterado_por": t_varchar(80),
-        },
-        "users": {
-            "username": t_varchar(80),
-            "pass_hash": t_varchar(255),
-            "role": t_varchar(30),
-            "is_active": "BOOLEAN" if dialect != "sqlite" else "INTEGER",
-            "created_at": t_ts(),
-        },
-    }
-
-    with eng.begin() as con:
-        for tbl, cols in desired.items():
-            have = existing_cols(tbl)
-            if not have:
-                continue
-            for col, sqltype in cols.items():
-                if col in have:
-                    continue
-                stmt = f'ALTER TABLE "{tbl}" ADD COLUMN "{col}" {sqltype}'
-                try:
-                    con.execute(text(stmt))
-                except Exception:
-                    pass
-
-def migrate_schema(eng):
-    """Best-effort schema migration (SQLite/Postgres) to keep old DBs compatible with the current code."""
+    Best-effort schema migration (SQLite/Postgres) to keep old DBs compatible with the current code.
+    - Não derruba o app se a tabela não existir
+    - Não derruba o app se a coluna já existir
+    """
     from sqlalchemy import text
 
     dialect = eng.dialect.name
@@ -1138,23 +825,21 @@ def migrate_schema(eng):
         ("obras", "created_at", "TIMESTAMP", "TIMESTAMP"),
         ("obras", "updated_at", "TIMESTAMP", "TIMESTAMP"),
 
-        # colaboradores
+        # legado: pode não existir
         ("colaboradores", "ativo", "INTEGER DEFAULT 1", "BOOLEAN DEFAULT TRUE"),
         ("colaboradores", "created_at", "TIMESTAMP", "TIMESTAMP"),
         ("colaboradores", "updated_at", "TIMESTAMP", "TIMESTAMP"),
 
-        # usuarios
         ("usuarios", "ativo", "INTEGER DEFAULT 1", "BOOLEAN DEFAULT TRUE"),
         ("usuarios", "perfil", "TEXT", "TEXT"),
         ("usuarios", "created_at", "TIMESTAMP", "TIMESTAMP"),
         ("usuarios", "updated_at", "TIMESTAMP", "TIMESTAMP"),
 
-        # settings/config
         ("settings", "key", "TEXT", "TEXT"),
         ("settings", "value", "TEXT", "TEXT"),
         ("settings", "updated_at", "TIMESTAMP", "TIMESTAMP"),
 
-        # concretagens (agendamentos)
+        # concretagens
         ("concretagens", "tipo_servico", "TEXT DEFAULT 'Concretagem'", "TEXT DEFAULT 'Concretagem'"),
         ("concretagens", "volume_m3", "REAL", "DOUBLE PRECISION"),
         ("concretagens", "duracao_min", "INTEGER", "INTEGER"),
@@ -1185,23 +870,31 @@ def migrate_schema(eng):
                     return False
 
             def add_col(table: str, col: str, ddl: str):
-                if not col_exists(table, col):
-                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {ddl};"))
+                try:
+                    if not col_exists(table, col):
+                        conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {ddl};"))
+                except Exception:
+                    pass
 
             for table, col, ddl_sqlite, _ddl_pg in cols:
                 add_col(table, col, ddl_sqlite)
 
         elif dialect in ("postgresql", "postgres"):
             def add_col_pg(table: str, col: str, ddl: str):
-                # Works on Postgres 9.6+ (ADD COLUMN IF NOT EXISTS)
-                conn.execute(text(f'ALTER TABLE "{table}" ADD COLUMN IF NOT EXISTS "{col}" {ddl};'))
+                try:
+                    conn.execute(text(
+                        f'ALTER TABLE IF EXISTS "{table}" '
+                        f'ADD COLUMN IF NOT EXISTS "{col}" {ddl};'
+                    ))
+                except Exception:
+                    pass
 
             for table, col, _ddl_sqlite, ddl_pg in cols:
                 add_col_pg(table, col, ddl_pg)
 
+
 def init_db():
     eng = get_engine()
-    # Testa conexão antes de tentar criar tabelas (evita crash "mudo" no Cloud)
     try:
         with eng.connect() as conn:
             conn.execute(text("SELECT 1"))
@@ -1231,13 +924,20 @@ DB_URL="postgresql://usuario:SENHA@HOST:PORT/DB?sslmode=require"
 3) Se sua senha tem caracteres especiais (ex: `@ # : /`), use a string do botão **Connect** do Supabase (Pooler/Supavisor), ou faça URL-encode desses caracteres.
 4) Clique em **Save** e depois **Reboot** no app.
 
-Se preferir, use o **Pooler (Supavisor)** no Supabase → Connect (recomendado para apps em nuvem).\n\n**Dica prática (resolve 90% dos casos no Streamlit Cloud):**\n- No Supabase → *Connect* → copie a string **Transaction pooler** (ou Session pooler)\n- Cole no DB_URL do Secrets (ela costuma usar host do tipo `aws-...pooler.supabase.com` e porta `6543`)\n
+**Dica prática (resolve 90% no Streamlit Cloud):**
+- Supabase → *Connect* → copie a string **Transaction pooler** (ou Session pooler)
+- Cole no DB_URL do Secrets (host tipo `...pooler.supabase.com` e porta `6543`)
 """)
         st.stop()
 
     metadata.create_all(eng)
     migrate_schema(eng)
     ensure_default_admin()
+
+
+# =============================================================================
+# DB util
+# =============================================================================
 
 def df_from_rows(rows, cols) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=cols)
@@ -1266,9 +966,11 @@ def fetch_one(stmt) -> Optional[Dict[str, Any]]:
         return None
     return df.iloc[0].to_dict()
 
-# ============================
-# Password hashing (PBKDF2)
-# ============================
+
+# =============================================================================
+# Auth / Users
+# =============================================================================
+
 def _pbkdf2_hash(password: str, salt_b64: str) -> str:
     salt = base64.b64decode(salt_b64.encode("utf-8"))
     dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000)
@@ -1283,9 +985,6 @@ def make_password(password: str) -> Tuple[str, str]:
 def verify_password(password: str, salt_b64: str, ph_b64: str) -> bool:
     return _pbkdf2_hash(password, salt_b64) == ph_b64
 
-# ============================
-# Users / Auth
-# ============================
 def ensure_default_admin():
     df = fetch_df(select(users.c.id).limit(1))
     if df.empty:
@@ -1367,24 +1066,16 @@ def require_login():
     if not st.session_state.get("user"):
         st.stop()
 
-# ============================
-# CNPJ lookup (BrasilAPI + fallbacks)
-# ============================
+
+# =============================================================================
+# CNPJ lookup
+# =============================================================================
 
 @st.cache_data(ttl=24*3600, show_spinner=False)
 def fetch_cnpj_data(cnpj: str):
-    """Busca dados públicos de CNPJ com fallback.
-
-    Retorna: (ok: bool, msg: str, payload: dict|None)
-    payload contém chaves:
-      - cnpj, razao_social, nome_fantasia, endereco, cidade, uf, cep, cliente_sugerido
-    """
     cnpj_digits = only_digits(cnpj or "")
     if len(cnpj_digits) != 14:
         return False, "CNPJ inválido (precisa ter 14 dígitos).", None
-
-    if requests is None:
-        return False, "Biblioteca 'requests' não está disponível no ambiente.", None
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Streamlit; +https://streamlit.io)",
@@ -1392,7 +1083,6 @@ def fetch_cnpj_data(cnpj: str):
     }
 
     def _mk_payload(parsed: dict) -> dict:
-        # garante todas as chaves esperadas
         return {
             "cnpj": parsed.get("cnpj") or cnpj_digits,
             "razao_social": parsed.get("razao_social") or "",
@@ -1405,7 +1095,6 @@ def fetch_cnpj_data(cnpj: str):
         }
 
     def _parse_brasilapi(j: dict) -> dict:
-        # BrasilAPI (cnpj/v1)
         legal_name = (j.get("razao_social") or "").strip()
         trade_name = (j.get("nome_fantasia") or "").strip()
         logradouro = (j.get("logradouro") or "").strip()
@@ -1430,8 +1119,6 @@ def fetch_cnpj_data(cnpj: str):
         }
 
     def _parse_cnpjws(j: dict) -> dict:
-        # publica.cnpj.ws
-        # Estrutura pode variar; usamos campos defensivos
         estab = j.get("estabelecimento") or {}
         legal_name = (j.get("razao_social") or j.get("nome") or "").strip()
         trade_name = (estab.get("nome_fantasia") or j.get("nome_fantasia") or "").strip()
@@ -1459,7 +1146,6 @@ def fetch_cnpj_data(cnpj: str):
         }
 
     def _parse_receitaws(j: dict) -> dict:
-        # receitaws.com.br
         legal_name = (j.get("nome") or j.get("razao_social") or "").strip()
         trade_name = (j.get("fantasia") or j.get("nome_fantasia") or "").strip()
         logradouro = (j.get("logradouro") or "").strip()
@@ -1493,38 +1179,34 @@ def fetch_cnpj_data(cnpj: str):
     for name, url, parser in providers:
         try:
             r = requests.get(url, headers=headers, timeout=12)
-            # alguns provedores respondem com html/text em erros
             ct = (r.headers.get("content-type") or "").lower()
             if r.status_code == 200 and ("json" in ct or r.text.strip().startswith("{")):
                 j = r.json()
-                # ReceitaWS retorna {"status":"ERROR", "message":...}
                 if isinstance(j, dict) and str(j.get("status", "")).upper() == "ERROR":
                     last_err = f"{name}: {j.get('message') or 'erro'}"
                     continue
                 parsed = parser(j if isinstance(j, dict) else {})
                 return True, "OK", _mk_payload(parsed)
-
-            # 404 = não achou nesse provedor (tenta o próximo)
             if r.status_code in (404, 429, 500, 502, 503, 504):
                 last_err = f"{name}: HTTP {r.status_code}"
                 continue
-
             last_err = f"{name}: HTTP {r.status_code}"
         except Exception as e:
             last_err = f"{name}: {type(e).__name__}: {e}"
 
     return False, f"Não foi possível consultar o CNPJ. ({last_err or 'sem detalhes'})", None
 
+
+# =============================================================================
+# Calculations
+# =============================================================================
+
 def calc_trucks(volume_m3: float, capacidade_m3: float = 8.0) -> int:
-    if volume_m3 <= 0:
+    if volume_m3 <= 0 or capacidade_m3 <= 0:
         return 0
-    if capacidade_m3 <= 0:
-        return 0
-    import math
     return int(math.ceil(volume_m3 / capacidade_m3))
 
 def calc_cp_qty(caminhoes_est: int, cps_por_caminhao: int) -> int:
-    """Estimativa de formas / corpos de prova totais = caminhões * CPs por caminhão."""
     try:
         c = int(caminhoes_est) if caminhoes_est is not None else 0
         p = int(cps_por_caminhao) if cps_por_caminhao is not None else 0
@@ -1537,6 +1219,11 @@ def calc_cp_qty(caminhoes_est: int, cps_por_caminhao: int) -> int:
 def default_duration_min(volume_m3: float) -> int:
     trucks = calc_trucks(volume_m3, 8.0)
     return int(60 + trucks * 12)
+
+
+# =============================================================================
+# Queries
+# =============================================================================
 
 def get_obras_df() -> pd.DataFrame:
     return fetch_df(select(
@@ -1593,20 +1280,12 @@ def get_concretagens_df(range_start, range_end) -> pd.DataFrame:
 
     df = pd.DataFrame(rows)
 
-    # Normalização de nomes de colunas (compatibilidade UI/Admin)
-    # Algumas consultas retornam alias em inglês (ex: created_at). Mantemos também o padrão pt-BR.
-    if "created_at" in df.columns and "criado_em" not in df.columns:
-        df["criado_em"] = df["created_at"]
-    if "updated_at" in df.columns and "atualizado_em" not in df.columns:
-        df["atualizado_em"] = df["updated_at"]
-
     if df.empty:
-        # garante colunas para não quebrar telas (ex.: dashboard) quando não há registros
         return pd.DataFrame(columns=[
-            "id","obra_id","obra","endereco","cliente","cidade","data","hora_inicio","hora_fim","duracao_min",
-            "tipo_servico","volume_m3","fck_mpa","slump_mm","bombeado","usina","bomba","equipe","colab_qtd","status",
+            "id","obra_id","obra","cliente","cidade","data","hora_inicio","hora_fim","duracao_min",
+            "tipo_servico","volume_m3","fck_mpa","slump_mm","usina","bomba","equipe","colab_qtd","status",
             "cap_caminhao_m3","cps_por_caminhao","caminhoes_est","formas_est",
-            "created_at","created_by","updated_at","updated_by","observacoes"
+            "created_at","criado_por","atualizado_em","alterado_por","observacoes"
         ])
 
     for col in ("duracao_min", "volume_m3", "fck_mpa", "slump_mm", "colab_qtd", "cap_caminhao_m3", "cps_por_caminhao", "caminhoes_est", "formas_est"):
@@ -1617,61 +1296,77 @@ def get_concretagens_df(range_start, range_end) -> pd.DataFrame:
     return df
 
 def get_next_concretagens_df(days: int = 7) -> pd.DataFrame:
-    """Retorna concretagens previstas a partir de hoje (inclusive) pelos próximos `days` dias."""
-    try:
-        ds = today_local()
-    except Exception:
-        ds = date.today()
+    ds = today_local()
     de = ds + timedelta(days=int(days))
     df = get_concretagens_df(ds, de)
-
-    # ordenação estável para telas (dashboard / agenda)
     sort_cols = [c for c in ("data", "hora_inicio", "obra") if c in df.columns]
     if sort_cols:
         df = df.sort_values(sort_cols, ascending=True, kind="stable")
     return df
-
 
 def get_concretagem_by_id(cid: int) -> Dict[str, Any]:
     row = fetch_one(select(concretagens).where(concretagens.c.id == int(cid)))
     return row or {}
 
 
+# =============================================================================
+# Audit / history
+# =============================================================================
 
-def update_concretagem_status(concretagem_id: int, new_status: str, usuario: str) -> None:
-    """Atualiza somente o status e registra auditoria (historico)."""
-    before = get_concretagem_by_id(int(concretagem_id))
+def add_history(concretagem_id: int, action: str, before: Any, after: Any, user: str):
+    detalhes = {"before": before, "after": after}
+    exec_stmt(insert(historico).values(
+        acao=str(action),
+        entidade="concretagens",
+        entidade_id=int(concretagem_id),
+        detalhes=json.dumps(detalhes, ensure_ascii=False, default=str),
+        usuario=str(user or ""),
+        criado_em=now_iso()
+    ))
+
+def get_history_df(concretagem_id: int) -> pd.DataFrame:
+    sql = select(
+        historico.c.id,
+        historico.c.criado_em,
+        historico.c.usuario,
+        historico.c.acao,
+        historico.c.detalhes,
+    ).where(
+        (historico.c.entidade == "concretagens") & (historico.c.entidade_id == int(concretagem_id))
+    ).order_by(historico.c.id.desc())
+
+    df = fetch_df(sql)
+
+    if not df.empty and "detalhes" in df.columns:
+        def _safe_parse(x):
+            try:
+                return json.loads(x) if isinstance(x, str) else x
+            except Exception:
+                return x
+        df["detalhes"] = df["detalhes"].apply(_safe_parse)
+    return df
+
+def delete_concretagem_by_id(cid: int, user: str) -> None:
+    cid = int(cid)
+    before = get_concretagem_by_id(cid)
     if not before:
-        raise ValueError("Concretagem não encontrada.")
-
-    eng = get_engine()
-    with eng.begin() as conn:
-        conn.execute(
-            update(concretagens)
-            .where(concretagens.c.id == int(concretagem_id))
-            .values(
-                status=str(new_status),
-                alterado_por=str(usuario),
-                atualizado_em=now_iso(),
-            )
-        )
-
-    after = get_concretagem_by_id(int(concretagem_id))
+        return
     try:
-        add_history(int(concretagem_id), "STATUS", before, after, str(usuario))
+        add_history(cid, "DELETE", before, None, user)
     except Exception:
-        # auditoria não pode derrubar o app
         pass
+    exec_stmt(delete(concretagens).where(concretagens.c.id == cid))
 
+
+# =============================================================================
+# Conflicts
+# =============================================================================
 
 def detect_schedule_conflicts(df: pd.DataFrame) -> list[dict]:
-    """Detecta conflitos simples (sobreposição) por equipe e por bomba."""
     if df is None or df.empty:
         return []
-
     required = {"id", "data", "hora_inicio", "duracao_min", "obra", "equipe", "bomba", "status"}
-    missing = [c for c in required if c not in df.columns]
-    if missing:
+    if any(c not in df.columns for c in required):
         return []
 
     rows = []
@@ -1711,120 +1406,10 @@ def detect_schedule_conflicts(df: pd.DataFrame) -> list[dict]:
             for i in range(1, len(items)):
                 a = items[i-1]; b = items[i]
                 if a["fim"] > b["inicio"]:
-                    out.append({
-                        "tipo": label,
-                        "recurso": rk,
-                        "a": a,
-                        "b": b,
-                    })
+                    out.append({"tipo": label, "recurso": rk, "a": a, "b": b})
         return out
 
-    conflicts = scan("equipe", "Equipe") + scan("bomba", "Bomba")
-    return conflicts
-
-
-def make_excel_bytes(df: pd.DataFrame, sheet_name: str = "Agendamentos") -> bytes:
-    bio = io.BytesIO()
-    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name=sheet_name[:31])
-    return bio.getvalue()
-
-
-def make_pdf_bytes(df: pd.DataFrame, titulo: str = "Agendamentos de Concretagens") -> bytes:
-    """PDF simples (1 página por bloco) com tabela resumida."""
-    try:
-        from reportlab.lib.pagesizes import A4, landscape
-        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-        from reportlab.lib import colors
-        from reportlab.lib.styles import getSampleStyleSheet
-    except Exception:
-        return b""
-
-    bio = io.BytesIO()
-    doc = SimpleDocTemplate(bio, pagesize=landscape(A4), leftMargin=18, rightMargin=18, topMargin=18, bottomMargin=18)
-    styles = getSampleStyleSheet()
-    story = []
-
-    story.append(Paragraph(f"<b>{titulo}</b>", styles["Title"]))
-    story.append(Spacer(1, 10))
-
-    cols = [c for c in ["data","hora_inicio","obra","cidade","volume_m3","fck_mpa","slump_mm","usina","bomba","equipe","status"] if c in df.columns]
-    data = [cols]
-    for _, r in df[cols].iterrows():
-        row = []
-        for c in cols:
-            v = r.get(c)
-            if isinstance(v, float):
-                row.append(f"{v:.2f}".replace(".", ","))
-            else:
-                row.append("" if v is None else str(v))
-        data.append(row)
-
-    tbl = Table(data, repeatRows=1)
-    tbl.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#0f172a")),
-        ("TEXTCOLOR", (0,0), (-1,0), colors.white),
-        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
-        ("FONTSIZE", (0,0), (-1,0), 9),
-        ("GRID", (0,0), (-1,-1), 0.25, colors.lightgrey),
-        ("FONTSIZE", (0,1), (-1,-1), 8),
-        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-    ]))
-    story.append(tbl)
-
-    doc.build(story)
-    return bio.getvalue()
-
-def delete_concretagem_by_id(cid: int, user: str) -> None:
-    """Exclui agendamento (concretagem) e registra no histórico."""
-    cid = int(cid)
-    before = get_concretagem_by_id(cid)
-    if not before:
-        return
-    # registra histórico antes de remover
-    add_history(cid, "DELETE", before, None, user)
-    exec_stmt(delete(concretagens).where(concretagens.c.id == cid))
-
-
-def add_history(concretagem_id: int, action: str, before: Any, after: Any, user: str):
-    """Registra auditoria no log genérico `historico`.
-
-    A tabela `historico` deste app é um log simples (acao, entidade, entidade_id, detalhes, usuario, criado_em).
-    Aqui salvamos before/after dentro de `detalhes` como JSON.
-    """
-    detalhes = {"before": before, "after": after}
-    exec_stmt(insert(historico).values(
-        acao=str(action),
-        entidade="concretagens",
-        entidade_id=int(concretagem_id),
-        detalhes=json.dumps(detalhes, ensure_ascii=False, default=str),
-        usuario=str(user or ""),
-        criado_em=now_iso()
-    ))
-
-def get_history_df(concretagem_id: int) -> pd.DataFrame:
-    # Histórias de concretagem ficam registradas no log genérico `historico`
-    sql = select(
-        historico.c.id,
-        historico.c.criado_em,
-        historico.c.usuario,
-        historico.c.acao,
-        historico.c.detalhes,
-    ).where(
-        (historico.c.entidade == "concretagens") & (historico.c.entidade_id == int(concretagem_id))
-    ).order_by(historico.c.id.desc())
-
-    df = fetch_df(sql)
-
-    # parse detalhes (se for JSON)
-    if not df.empty and "detalhes" in df.columns:
-        def _safe_parse(x):
-            try:
-                return json.loads(x) if isinstance(x, str) else x
-            except Exception:
-                return x
-        df["detalhes"] = df["detalhes"].apply(_safe_parse)
-    return df
+    return scan("equipe", "Equipe") + scan("bomba", "Bomba")
 
 def find_conflicts(
     date_iso: str,
@@ -1834,7 +1419,6 @@ def find_conflicts(
     equipe: str = "",
     ignore_id: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
-    """Detecta conflitos de agenda (sobreposição de horários) para a mesma bomba e/ou equipe no mesmo dia."""
     d = ensure_date(date_iso)
 
     def _parse_time(t) -> Optional[time]:
@@ -1845,7 +1429,6 @@ def find_conflicts(
         s = str(t).strip()
         if not s:
             return None
-        # aceita HH:MM ou HH:MM:SS
         try:
             parts = s.split(":")
             hh = int(parts[0])
@@ -1889,13 +1472,12 @@ def find_conflicts(
 
     conflicts: List[Dict[str, Any]] = []
     for r in rows:
-        # filtra por recurso (bomba/equipe). Se não informar nada, considera qualquer sobreposição do dia.
         reasons = []
         rb = (str(r.get("bomba") or "").strip().lower())
-        re = (str(r.get("equipe") or "").strip().lower())
+        re_ = (str(r.get("equipe") or "").strip().lower())
         if nb and rb == nb:
             reasons.append("bomba")
-        if ne and re == ne:
+        if ne and re_ == ne:
             reasons.append("equipe")
         if not (nb or ne):
             reasons = ["agenda"]
@@ -1927,16 +1509,66 @@ def find_conflicts(
 
     return conflicts
 
-def export_excel(df: pd.DataFrame) -> bytes:
-    import io
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Agendamentos")
-    return output.getvalue()
 
-# ============================
+# =============================================================================
+# Export helpers
+# =============================================================================
+
+def make_excel_bytes(df: pd.DataFrame, sheet_name: str = "Agendamentos") -> bytes:
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name[:31])
+    return bio.getvalue()
+
+def make_pdf_bytes(df: pd.DataFrame, titulo: str = "Agendamentos de Concretagens") -> bytes:
+    try:
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+        from reportlab.lib import colors
+        from reportlab.lib.styles import getSampleStyleSheet
+    except Exception:
+        return b""
+
+    bio = io.BytesIO()
+    doc = SimpleDocTemplate(bio, pagesize=landscape(A4), leftMargin=18, rightMargin=18, topMargin=18, bottomMargin=18)
+    styles = getSampleStyleSheet()
+    story = []
+
+    story.append(Paragraph(f"<b>{titulo}</b>", styles["Title"]))
+    story.append(Spacer(1, 10))
+
+    cols = [c for c in ["data","hora_inicio","obra","cidade","volume_m3","fck_mpa","slump_mm","usina","bomba","equipe","status"] if c in df.columns]
+    data = [cols]
+    for _, r in df[cols].iterrows():
+        row = []
+        for c in cols:
+            v = r.get(c)
+            if isinstance(v, float):
+                row.append(f"{v:.2f}".replace(".", ","))
+            else:
+                row.append("" if v is None else str(v))
+        data.append(row)
+
+    tbl = Table(data, repeatRows=1)
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#0f172a")),
+        ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ("FONTSIZE", (0,0), (-1,0), 9),
+        ("GRID", (0,0), (-1,-1), 0.25, colors.lightgrey),
+        ("FONTSIZE", (0,1), (-1,-1), 8),
+        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+    ]))
+    story.append(tbl)
+
+    doc.build(story)
+    return bio.getvalue()
+
+
+# =============================================================================
 # App start
-# ============================
+# =============================================================================
+
 st.set_page_config(page_title="Agendamentos de Concretagens", layout="wide")
 st.markdown(f"<style>{WIN11_CSS}</style>", unsafe_allow_html=True)
 
@@ -1962,8 +1594,6 @@ st.markdown(
 login_box()
 require_login()
 
-
-# Datas base (usadas em várias páginas)
 today = today_local()
 week_start = today - timedelta(days=today.weekday())
 week_end = week_start + timedelta(days=6)
@@ -1974,7 +1604,6 @@ menu = st.sidebar.radio(
     index=0
 )
 
-# Indicador global de capacidade diária (fica 'aceso' quando lota)
 try:
     _cap = get_team_capacity()
     _comm = get_committed_collaborators(today_local().isoformat())
@@ -1986,6 +1615,10 @@ except Exception:
     pass
 
 
+# =============================================================================
+# Pages
+# =============================================================================
+
 if menu == "Dashboard":
     st.markdown("## 📌 Próximos serviços (7 dias)")
     df_next = get_next_concretagens_df(7)
@@ -1993,19 +1626,18 @@ if menu == "Dashboard":
     if df_next.empty:
         st.info("Sem concretagens cadastradas para os próximos 7 dias.")
     else:
-        # -------------------- filtros --------------------
         with st.expander("🔎 Filtros", expanded=False):
             c1, c2, c3 = st.columns([2,2,2])
             with c1:
                 f_status = st.multiselect(
                     "Status",
-                    STATUS_LIST,
+                    STATUS,
                     default=["Agendado","Aguardando","Confirmado","Execucao"],
                     key=uniq_key("dash_status")
                 )
             with c2:
-                obras = sorted([o for o in df_next["obra"].dropna().unique().tolist() if str(o).strip()])
-                f_obras = st.multiselect("Obras", obras, default=[], key=uniq_key("dash_obras"))
+                obras_list = sorted([o for o in df_next["obra"].dropna().unique().tolist() if str(o).strip()])
+                f_obras = st.multiselect("Obras", obras_list, default=[], key=uniq_key("dash_obras"))
             with c3:
                 cidades = sorted([c for c in df_next.get("cidade", pd.Series([], dtype=str)).dropna().unique().tolist() if str(c).strip()])
                 f_cidades = st.multiselect("Cidades", cidades, default=[], key=uniq_key("dash_cidades"))
@@ -2032,7 +1664,6 @@ if menu == "Dashboard":
         if f_usinas and "usina" in show.columns:
             show = show[show["usina"].isin(f_usinas)]
 
-        # -------------------- KPIs --------------------
         total = int(len(show))
         total_m3 = float(show["volume_m3"].fillna(0).sum()) if "volume_m3" in show.columns else 0.0
         total_formas = int(show["formas_est"].fillna(0).sum()) if "formas_est" in show.columns else 0
@@ -2042,48 +1673,20 @@ if menu == "Dashboard":
         qtd_conf = len(conflicts)
 
         k1, k2, k3, k4, k5 = st.columns([1.1,1.1,1.1,1.1,1.1])
-        with k1:
-            st.metric("Agendamentos", f"{total}")
-        with k2:
-            st.metric("Volume total", f"{fmt_compact_num(total_m3)} m³")
-        with k3:
-            st.metric("Formas (período)", f"{total_formas}")
-        with k4:
-            st.metric("Hoje", f"{qtd_hoje}")
-        with k5:
-            st.metric("Conflitos", f"{qtd_conf}")
-        with k5:
-            st.metric("Formas (cota)", f"{total_formas}")
+        with k1: st.metric("Agendamentos", f"{total}")
+        with k2: st.metric("Volume total", f"{fmt_compact_num(total_m3)} m³")
+        with k3: st.metric("Formas (período)", f"{total_formas}")
+        with k4: st.metric("Hoje", f"{qtd_hoje}")
+        with k5: st.metric("Conflitos", f"{qtd_conf}")
 
+        if qtd_conf > 0:
+            with st.expander("⚠️ Conflitos detectados", expanded=True):
+                for c in conflicts[:10]:
+                    a = c["a"]; b = c["b"]
+                    st.write(f"• **{c['tipo']}** `{c['recurso']}` — ID {a['id']} ({a['data']} {a['hora']}) x ID {b['id']} ({b['data']} {b['hora']})")
 
-        # -------------------- Alertas rápidos --------------------
-        missing_eq = int((show.get("equipe","").fillna("").astype(str).str.strip() == "").sum()) if "equipe" in show.columns else 0
-        missing_us = int((show.get("usina","").fillna("").astype(str).str.strip() == "").sum()) if "usina" in show.columns else 0
-
-        if qtd_conf > 0 or missing_eq > 0 or missing_us > 0:
-            with st.expander("⚠️ Alertas (atenção rápida)", expanded=True):
-                if qtd_conf > 0:
-                    st.warning(f"Foram detectados **{qtd_conf}** possíveis conflitos de agenda (sobreposição por equipe/bomba).")
-                    # listar só os 5 primeiros para não poluir
-                    for c in conflicts[:5]:
-                        a = c["a"]; b = c["b"]
-                        st.write(f"• **{c['tipo']}**: `{c['recurso']}` — ID {a['id']} ({a['data']} {a['hora']}) x ID {b['id']} ({b['data']} {b['hora']})")
-                if missing_eq > 0:
-                    st.info(f"Há **{missing_eq}** agendamento(s) sem **equipe** preenchida.")
-                if missing_us > 0:
-                    st.info(f"Há **{missing_us}** agendamento(s) sem **usina/fornecedor** preenchido.")
-
-        # -------------------- Export --------------------
         with st.expander("⬇️ Exportar", expanded=False):
             exp = show.copy()
-            # manter números amigáveis na exportação
-            if "volume_m3" in exp.columns:
-                exp["volume_m3"] = exp["volume_m3"].astype(float).round(2)
-            if "fck_mpa" in exp.columns:
-                exp["fck_mpa"] = exp["fck_mpa"].astype(float).round(1)
-            if "slump_mm" in exp.columns:
-                exp["slump_mm"] = exp["slump_mm"].astype(float).round(0).astype("Int64")
-
             st.download_button(
                 "📄 Baixar CSV",
                 data=exp.to_csv(index=False).encode("utf-8"),
@@ -2092,7 +1695,6 @@ if menu == "Dashboard":
                 use_container_width=True,
                 key=uniq_key("dash_csv"),
             )
-
             xbytes = make_excel_bytes(exp, sheet_name="7_dias")
             st.download_button(
                 "📊 Baixar Excel",
@@ -2102,7 +1704,6 @@ if menu == "Dashboard":
                 use_container_width=True,
                 key=uniq_key("dash_xlsx"),
             )
-
             pbytes = make_pdf_bytes(exp, titulo="Agendamentos — Próximos 7 dias")
             if pbytes:
                 st.download_button(
@@ -2114,10 +1715,8 @@ if menu == "Dashboard":
                     key=uniq_key("dash_pdf"),
                 )
 
-        # -------------------- Visualização --------------------
         st.divider()
 
-        # preparar versão "de tela" (sem zeros e sem rolagem lateral)
         show_disp = show.copy()
         if "volume_m3" in show_disp.columns:
             show_disp["volume_m3"] = show_disp["volume_m3"].astype(float).round(2).map(lambda x: str(x).replace(".", ",").rstrip("0").rstrip(",") if pd.notna(x) else "")
@@ -2126,77 +1725,22 @@ if menu == "Dashboard":
         if "slump_mm" in show_disp.columns:
             show_disp["slump_mm"] = show_disp["slump_mm"].astype(float).round(0).astype("Int64").astype(str).replace("<NA>", "")
 
-        # modo padrão: cards (mostra tudo sem rolar pro lado)
-        if "modo" not in locals():
-            modo = "Cards (recomendado)"
-
         if modo.startswith("Cards"):
             st.caption("📌 Dica: os cards mostram todas as informações **sem precisar arrastar para o lado**.")
             render_concretagens_cards(show_disp, title="")
         else:
             cols = [c for c in ["data","hora_inicio","obra","cliente","cidade","tipo_servico","volume_m3","fck_mpa","slump_mm","caminhoes_est","formas_est","usina","bomba","equipe","status"] if c in show_disp.columns]
-            st.dataframe(
-                show_disp[cols],
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "data": st.column_config.TextColumn("Data", width="small"),
-                    "hora_inicio": st.column_config.TextColumn("Hora", width="small"),
-                    "volume_m3": st.column_config.TextColumn("Volume (m³)", width="small"),
-                    "fck_mpa": st.column_config.TextColumn("FCK (MPa)", width="small"),
-                    "slump_mm": st.column_config.TextColumn("Slump (mm)", width="small"),
-                },
-            )
+            st.dataframe(show_disp[cols], use_container_width=True, hide_index=True)
 
-        # -------------------- Ações rápidas --------------------
-        st.divider()
-        with st.expander("⚡ Ações rápidas (status)", expanded=False):
-            if show.empty:
-                st.info("Nenhum item no filtro atual.")
-            else:
-                opt_map = {
-                    int(r["id"]): f"ID {int(r['id'])} — {r.get('data','')} {r.get('hora_inicio','')} — {r.get('obra','')} — {r.get('status','')}"
-                    for _, r in show.iterrows()
-                    if pd.notna(r.get("id"))
-                }
-                sel_id = st.selectbox("Selecione um agendamento", list(opt_map.keys()), format_func=lambda x: opt_map.get(int(x), str(x)), key=uniq_key("dash_sel_id"))
-                row = get_concretagem_by_id(int(sel_id)) or {}
-                cur = str(row.get("status") or "")
-
-                st.write(f"**Status atual:** `{cur}`")
-                b1, b2, b3, b4 = st.columns(4)
-                with b1:
-                    if st.button("✅ Confirmar", use_container_width=True, disabled=(cur == "Confirmado"), key=uniq_key("dash_btn_confirm")):
-                        update_concretagem_status(int(sel_id), "Confirmado", user)
-                        st.success("Status atualizado para Confirmado.")
-                        st.rerun()
-                with b2:
-                    if st.button("🚧 Execução", use_container_width=True, disabled=(cur == "Execucao"), key=uniq_key("dash_btn_exec")):
-                        update_concretagem_status(int(sel_id), "Execucao", user)
-                        st.success("Status atualizado para Execucao.")
-                        st.rerun()
-                with b3:
-                    if st.button("🏁 Concluído", use_container_width=True, disabled=(cur == "Concluido"), key=uniq_key("dash_btn_done")):
-                        update_concretagem_status(int(sel_id), "Concluido", user)
-                        st.success("Status atualizado para Concluido.")
-                        st.rerun()
-                with b4:
-                    if st.button("🛑 Cancelar", use_container_width=True, disabled=(cur == "Cancelado"), key=uniq_key("dash_btn_cancel")):
-                        update_concretagem_status(int(sel_id), "Cancelado", user)
-                        st.success("Status atualizado para Cancelado.")
-                        st.rerun()
 
 elif menu == "Obras":
     st.subheader("🏗️ Cadastro de Obras")
 
     mode = st.radio("Modo", ["Cadastrar", "Editar"], horizontal=True)
-
     df_obras = get_obras_df()
 
     if mode == "Cadastrar":
         st.markdown("#### ➕ Nova obra")
-        st.markdown('<div class="hab-card">', unsafe_allow_html=True)
-
         cnpj_in = st.text_input("CNPJ (opcional)", value=st.session_state.get("obra_new_cnpj", ""))
 
         colx1, colx2 = st.columns([1, 1])
@@ -2242,7 +1786,7 @@ elif menu == "Obras":
                         cidade=cidade.strip(),
                         responsavel=responsavel.strip(),
                         telefone=telefone.strip(),
-                        criado_em=_local_now(),
+                        criado_em=now_iso(),
                         cnpj=only_digits(cnpj_clean),
                         razao_social=razao_social.strip(),
                         nome_fantasia=nome_fantasia.strip()
@@ -2257,8 +1801,6 @@ elif menu == "Obras":
                         pass
                     st.rerun()
 
-        st.markdown('</div>', unsafe_allow_html=True)
-
     else:
         st.markdown("#### ✏️ Editar obra")
         if df_obras.empty:
@@ -2267,25 +1809,18 @@ elif menu == "Obras":
             labels = df_obras.apply(lambda r: f"#{r['id']} — {r['nome']} ({r.get('cliente','') or 'Sem cliente'})", axis=1).tolist()
             pick = st.selectbox("Selecione a obra", labels)
             obra_id = int(pick.split("—")[0].replace("#", "").strip())
-
             row = df_obras[df_obras["id"] == obra_id].iloc[0].to_dict()
-
-            st.markdown('<div class="hab-card">', unsafe_allow_html=True)
 
             cnpj_edit = st.text_input("CNPJ", value=row.get("cnpj") or "", key=f"cnpj_edit_{obra_id}")
 
-            coly1, coly2 = st.columns([1, 1])
-            with coly1:
-                if st.button("🔎 Atualizar dados pelo CNPJ", use_container_width=True, key=f"btn_cnpj_edit_{obra_id}", type="primary"):
-                    ok, msg, payload = fetch_cnpj_data(cnpj_edit)
-                    if not ok:
-                        st.error(msg)
-                    else:
-                        st.session_state[f"edit_prefill_{obra_id}"] = payload
-                        st.success("Dados do CNPJ carregados ✅")
-                        st.rerun()
-            with coly2:
-                st.caption("Atualiza Cliente/Endereço/Cidade automaticamente.")
+            if st.button("🔎 Atualizar dados pelo CNPJ", use_container_width=True, key=f"btn_cnpj_edit_{obra_id}", type="primary"):
+                ok, msg, payload = fetch_cnpj_data(cnpj_edit)
+                if not ok:
+                    st.error(msg)
+                else:
+                    st.session_state[f"edit_prefill_{obra_id}"] = payload
+                    st.success("Dados do CNPJ carregados ✅")
+                    st.rerun()
 
             pre = st.session_state.get(f"edit_prefill_{obra_id}", {})
             nome_val = row.get("nome") or ""
@@ -2323,13 +1858,13 @@ elif menu == "Obras":
                                 telefone=telefone.strip(),
                                 cnpj=only_digits(cnpj_clean),
                                 razao_social=razao_social.strip(),
-                                nome_fantasia=nome_fantasia.strip()
+                                nome_fantasia=nome_fantasia.strip(),
+                                atualizado_em=now_iso(),
+                                alterado_por=current_user(),
                             ))
                         st.session_state.pop(f"edit_prefill_{obra_id}", None)
                         st.success("Obra atualizada ✅")
                         st.rerun()
-
-            st.markdown('</div>', unsafe_allow_html=True)
 
     st.divider()
     st.markdown("#### 📚 Obras cadastradas")
@@ -2337,23 +1872,15 @@ elif menu == "Obras":
     if df_obras.empty:
         st.info("Nenhuma obra cadastrada.")
     else:
-        show = df_obras[["id","nome","cliente","cidade","cnpj","endereco","responsavel","telefone","criado_em"]].copy()
-        st.dataframe(format_df_numbers(show), use_container_width=True, hide_index=True)
+        st.dataframe(df_obras, use_container_width=True, hide_index=True)
 
-# ============================
-# Novo agendamento
-# ============================
 
 elif menu == "Agenda (calendário)":
     st.subheader("📅 Agenda (calendário semanal)")
 
     colw1, colw2, colw3 = st.columns([1.2, 1.0, 1.0])
     with colw1:
-        ref_day = st.date_input(
-            "Semana de referência",
-            value=today,
-            help="Selecione qualquer dia da semana que deseja visualizar."
-        )
+        ref_day = st.date_input("Semana de referência", value=today, help="Selecione qualquer dia da semana.")
     week_start_cal = ref_day - timedelta(days=ref_day.weekday())
     week_end_cal = week_start_cal + timedelta(days=6)
 
@@ -2376,21 +1903,18 @@ elif menu == "Agenda (calendário)":
         if status_sel:
             df_week = df_week[df_week["status"].isin(status_sel)].copy()
 
-    st.caption(
-        f"Período: {week_start_cal.strftime('%d/%m/%Y')} a {week_end_cal.strftime('%d/%m/%Y')} ({TZ_LABEL})"
-    )
+    st.caption(f"Período: {week_start_cal.strftime('%d/%m/%Y')} a {week_end_cal.strftime('%d/%m/%Y')} ({TZ_LABEL})")
 
     if df_week.empty:
         st.info("Nenhum agendamento encontrado para os filtros selecionados.")
     else:
-        # Pré-calcular conflitos por dia (sobreposição e mesmo recurso bomba/equipe)
         conflicts_ids: set[int] = set()
 
         def _hhmm(s: str) -> str:
             s = str(s or "")
             return s[:5] if len(s) >= 5 else s
 
-        for d, g in df_week.groupby("data"):
+        for dday, g in df_week.groupby("data"):
             g2 = g.copy()
             g2 = g2[g2["status"].isin(["Agendado", "Aguardando", "Confirmado", "Execucao"])]
             g2 = g2.sort_values(by=["hora_inicio", "hora_fim"])
@@ -2450,6 +1974,7 @@ elif menu == "Agenda (calendário)":
                         st.caption(f"Responsável: {r.get('responsavel','')}")
                         st.caption(f"Status: {status}")
 
+
 elif menu == "Novo agendamento":
     st.subheader("🗓️ Novo agendamento")
 
@@ -2460,11 +1985,10 @@ elif menu == "Novo agendamento":
         labels = df_obras.apply(lambda r: f"#{r['id']} — {r['nome']} ({r.get('cliente','') or 'Sem cliente'})", axis=1).tolist()
         id_map = {labels[i]: int(df_obras.iloc[i]["id"]) for i in range(len(labels))}
 
-        st.markdown('<div class="hab-card">', unsafe_allow_html=True)
         with st.form("form_conc_new"):
             obra_sel = st.selectbox("Obra *", labels)
             tipo_servico = st.selectbox("Tipo de serviço *", SERVICE_TYPES, index=0)
-            is_concretagem = (tipo_servico == "Concretagem")
+
             cA, cB = st.columns(2)
             with cA:
                 d = st.date_input("Data *", value=today)
@@ -2484,7 +2008,7 @@ elif menu == "Novo agendamento":
                 with cF:
                     slump = st.text_input("Slump (cm)", value="")
                 with cG:
-                    bombeado = st.checkbox("Bombeado?", value=False)
+                    st.checkbox("Bombeado?", value=False, disabled=True)
 
                 st.markdown("**📌 Cota de rupturas (estimativa)**")
                 cH, cI = st.columns(2)
@@ -2501,7 +2025,6 @@ elif menu == "Novo agendamento":
                 volume = 0.0
                 fck = None
                 slump = ""
-                bombeado = False
                 dur = st.number_input("Duração prevista (min) *", min_value=15, value=60, step=5)
                 cap = None
                 cps_por_cam = None
@@ -2515,7 +2038,7 @@ elif menu == "Novo agendamento":
             colab_qtd = st.number_input("Colaboradores na obra (qtd)", min_value=1, step=1, value=1)
             status = st.selectbox("Status", STATUS, index=STATUS.index("Agendado"))
             obs = st.text_area("Observações", value="")
-            # alerta de capacidade (não bloqueia)
+
             _cap_total = get_team_capacity(12)
             _committed = get_committed_collaborators(d.strftime("%Y-%m-%d"))
             _projected = int(_committed) + int(colab_qtd or 1)
@@ -2533,7 +2056,7 @@ elif menu == "Novo agendamento":
                 if conflicts:
                     st.warning("⚠️ Conflito detectado (mesma bomba/equipe no mesmo horário). Você ainda pode salvar mesmo assim.")
                     st.dataframe(pd.DataFrame(conflicts), use_container_width=True, hide_index=True)
-                    
+
                 user = current_user()
                 now = now_iso()
 
@@ -2564,14 +2087,13 @@ elif menu == "Novo agendamento":
                 ))
 
                 after = get_concretagem_by_id(new_id)
-                add_history(new_id, "CREATE", None, after, user)
+                try:
+                    add_history(new_id, "CREATE", None, after, user)
+                except Exception:
+                    pass
                 st.success(f"Agendamento criado ✅ (ID {new_id})")
 
-        st.markdown('</div>', unsafe_allow_html=True)
 
-# ============================
-# Agenda (lista) + editar
-# ============================
 elif menu == "Agenda (lista)":
     st.subheader("📋 Agenda (lista)")
 
@@ -2606,13 +2128,16 @@ elif menu == "Agenda (lista)":
 
         view_cols = [
             "id","data","hora_inicio","hora_fim","duracao_min","tipo_servico",
-            "obra","cliente","cidade","endereco",
-            "volume_m3","caminhoes_est","formas_est","fck_mpa","slump_mm","bombeado",
+            "obra","cliente","cidade",
+            "volume_m3","caminhoes_est","formas_est","fck_mpa","slump_mm",
             "cap_caminhao_m3","cps_por_caminhao","usina","bomba","equipe","colab_qtd","status",
             "criado_por","alterado_por","atualizado_em","observacoes"
         ]
-        view = df[view_cols].copy()
-        st.dataframe(style_status_df(view), use_container_width=True, hide_index=True)
+
+        # ✅ PATCH: evita KeyError quando alguma coluna não existir
+        cols_ok = [c for c in view_cols if c in df.columns]
+        view = df[cols_ok].copy()
+        st.dataframe(view, use_container_width=True, hide_index=True)
 
         st.divider()
         st.markdown("### ✏️ Editar agendamento")
@@ -2620,23 +2145,12 @@ elif menu == "Agenda (lista)":
         sel_id = st.selectbox("Selecione pelo ID", ids)
 
         row = df[df["id"] == sel_id].iloc[0].to_dict()
-        st.markdown(
-            f"""
-            <div class="hab-card">
-              <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center;">
-                <div><b>ID {sel_id}</b> • {row.get('data')} {row.get('hora_inicio')} • <span class="small-muted">{row.get('obra')}</span></div>
-                <div>{status_chip(row.get('status'))}</div>
-              </div>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
 
         with st.form("edit_form"):
             c1, c2 = st.columns(2)
             with c1:
                 new_status = st.selectbox("Status", STATUS, index=STATUS.index(row["status"]))
-            TIPOS_SERVICO = ["Concretagem", "Ensaio de solo", "Coleta de solo", "Arrancamento", "Coleta de blocos e prismas"]
+            TIPOS_SERVICO = ["Concretagem", "Ensaio de Solo", "Coleta de Solo", "Arrancamento", "Coleta de Blocos", "Coleta de Prismas"]
             cur_tipo = (row.get("tipo_servico") or "Concretagem")
             try:
                 idx_tipo = TIPOS_SERVICO.index(cur_tipo)
@@ -2645,7 +2159,7 @@ elif menu == "Agenda (lista)":
             new_tipo_servico = st.selectbox("Tipo de serviço", TIPOS_SERVICO, index=idx_tipo, key=uniq_key("agenda_edit_tipo"))
 
             with c2:
-                new_dur = st.number_input("Duração (min)", min_value=15, value=int(row["duracao_min"]), step=5)
+                new_dur = st.number_input("Duração (min)", min_value=15, value=int(row.get("duracao_min") or 60), step=5)
 
             c3, c4 = st.columns(2)
             with c3:
@@ -2673,22 +2187,17 @@ elif menu == "Agenda (lista)":
 
             c11, c12 = st.columns(2)
             with c11:
-                new_cps_por_cam = st.number_input("Corpos de prova por caminhão (séries)", min_value=1, max_value=10, value=int(row.get("cps_por_caminhao") or 4), step=1)
+                new_cps_por_cam = st.number_input("Corpos de prova por caminhão (séries)", min_value=1, max_value=10, value=int(row.get("cps_por_caminhao") or 6), step=1)
             with c12:
                 if new_tipo_servico == "Concretagem":
                     new_caminhoes_est = calc_trucks(new_volume, new_cap)
-                    new_formas_est = calc_cp_qty(new_caminhoes_est, new_cps)
+                    # ✅ PATCH: new_cps -> new_cps_por_cam
+                    new_formas_est = calc_cp_qty(new_caminhoes_est, new_cps_por_cam)
                     st.caption(f"Estimativa: **{new_caminhoes_est} caminhão(ões)** → **{new_formas_est} CPs/forma(s)**")
                 else:
                     new_caminhoes_est = 0
                     new_formas_est = 0
                     st.caption("Estimativas de caminhões/CPs aplicam-se somente para Concretagem.")
-
-            _cap_total_edit = get_team_capacity(12)
-            _committed_edit = get_committed_collaborators(str(row.get("data") or ""))
-            _projected_edit = int(_committed_edit) - int(row.get("colab_qtd") or 1) + int(new_colab_qtd or 1)
-            if _projected_edit > int(_cap_total_edit):
-                st.warning(f"⚠️ Este ajuste deixa o dia acima da capacidade: {_projected_edit}/{_cap_total_edit} colaboradores comprometidos.")
 
             new_obs = st.text_area("Observações", value=str(row.get("observacoes") or ""))
 
@@ -2696,14 +2205,14 @@ elif menu == "Agenda (lista)":
 
             if salvar:
                 before = get_concretagem_by_id(int(sel_id))
-                data_str = str(before["data"])
-                hora_str = str(before["hora_inicio"])
+                data_str = str(before.get("data") or "")
+                hora_str = str(before.get("hora_inicio") or "")
 
                 conflicts = find_conflicts(data_str, hora_str, int(new_dur), new_bomba, new_equipe, ignore_id=int(sel_id))
                 if conflicts:
                     st.warning("⚠️ Conflito detectado (mesma bomba/equipe no mesmo horário). Você ainda pode salvar mesmo assim.")
                     st.dataframe(pd.DataFrame(conflicts), use_container_width=True, hide_index=True)
-                    
+
                 user = current_user()
                 now = now_iso()
 
@@ -2720,7 +2229,8 @@ elif menu == "Agenda (lista)":
                         volume_m3=float(new_volume),
                         tipo_servico=(new_tipo_servico or None),
                         cap_caminhao_m3=float(new_cap) if new_cap else None,
-                        cps_por_caminhao=int(new_cps) if new_cps else None,
+                        # ✅ PATCH: new_cps -> new_cps_por_cam
+                        cps_por_caminhao=int(new_cps_por_cam) if new_cps_por_cam else None,
                         caminhoes_est=int(new_caminhoes_est),
                         formas_est=int(new_formas_est),
                         fck_mpa=float(new_fck) if new_fck else None,
@@ -2730,11 +2240,13 @@ elif menu == "Agenda (lista)":
                     ))
 
                 after = get_concretagem_by_id(int(sel_id))
-                add_history(int(sel_id), "UPDATE", before, after, user)
+                try:
+                    add_history(int(sel_id), "UPDATE", before, after, user)
+                except Exception:
+                    pass
 
                 st.success("Atualizado ✅")
                 st.rerun()
-
 
         st.markdown("---")
         with st.expander("🗑️ Excluir agendamento", expanded=False):
@@ -2749,9 +2261,7 @@ elif menu == "Agenda (lista)":
                 except Exception as e:
                     st.error(f"Falha ao excluir: {e}")
 
-# ============================
-# Histórico
-# ============================
+
 elif menu == "Histórico":
     st.subheader("🧾 Histórico de alterações (auditoria)")
 
@@ -2800,25 +2310,9 @@ elif menu == "Histórico":
                     with c2:
                         st.caption("Depois")
                         st.json(after or {})
-                    with st.expander("🗑️ Excluir agendamento", expanded=False):
-                        st.warning("Atenção: a exclusão é permanente e remove o agendamento da agenda.")
-                        confirm = st.text_input("Digite EXCLUIR para confirmar", key=uniq_key(f"hist_del_confirm_{sel_id}"))
-                        can_del = (confirm or "").strip().upper() == "EXCLUIR"
-                        if st.button("Confirmar exclusão", key=uniq_key(f"hist_del_btn_{sel_id}"), type="primary", disabled=(not can_del)):
-                            delete_concretagem_by_id(int(sel_id), current_user())
-                            st.success("✅ Agendamento excluído.")
-                            try:
-                                st.cache_data.clear()
-                            except Exception:
-                                pass
-                            st.rerun()
-
-
                     st.divider()
 
-# ============================
-# Admin
-# ============================
+
 elif menu == "Admin":
     st.subheader("🛠️ Admin")
 
@@ -2917,13 +2411,14 @@ elif menu == "Admin":
         if df.empty:
             st.info("Nada no período.")
         else:
-            rep = df[[
+            rep_cols = [c for c in [
                 "data","hora_inicio","duracao_min","obra","cliente","cidade",
                 "volume_m3","fck_mpa","slump_mm","usina","bomba","equipe","status",
-                "criado_por","alterado_por","criado_em","atualizado_em","observacoes"
-            ]].copy()
-            st.dataframe(style_status_df(rep), use_container_width=True, hide_index=True)
-            xlsx = export_excel(rep)
+                "criado_por","alterado_por","created_at","atualizado_em","observacoes"
+            ] if c in df.columns]
+            rep = df[rep_cols].copy()
+            st.dataframe(rep, use_container_width=True, hide_index=True)
+            xlsx = make_excel_bytes(rep, sheet_name="Agendamentos")
             st.download_button(
                 "⬇️ Baixar Excel",
                 data=xlsx,
